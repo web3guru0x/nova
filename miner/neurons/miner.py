@@ -223,6 +223,7 @@ class Miner:
                     bt.logging.debug(f'Running inference...')
                     chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                     chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                    print(f"🔹 Score: {chunk_psichic_scores[self.psichic_result_column_name].iloc[0]}")
                     if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                         async with self.shared_lock:
                             candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
