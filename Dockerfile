@@ -37,7 +37,10 @@ RUN git clone https://github.com/metanova-labs/nova.git && cd nova
 COPY .env /workspace/nova/.env
 
 # Instalăm dependențele Nova (inclusiv PyTorch și Bittensor)
-RUN cd /workspace/nova && export PATH=$HOME/.local/bin:$PATH && bash install_deps_cu124.sh
+RUN cd /workspace/nova && export PATH=$HOME/.local/bin:$PATH && bash install_deps_cu124.sh || echo "Install script failed, continuing..."
 
 # Setăm punctul de intrare
-ENTRYPOINT ["/bin/bash"]
+ENTRYPOINT ["/bin/bash", "-c", "tail -f /dev/null"]
+CMD ["/bin/bash"]
+
+
