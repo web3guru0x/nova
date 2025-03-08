@@ -54,6 +54,10 @@ class PsichicWrapper:
                                               weights_only=True
                                               )
                                    )
+        print("🔹 CUDA Memory Allocated:", torch.cuda.memory_allocated() / 1e9, "GB")
+        print("🔹 CUDA Memory Reserved:", torch.cuda.memory_reserved() / 1e9, "GB")
+        print("🔹 CUDA Max Allocated:", torch.cuda.max_memory_allocated() / 1e9, "GB")
+
         
     def initialize_protein(self, protein_seq:str) -> dict:
         self.protein_seq = [protein_seq]
@@ -90,6 +94,7 @@ class PsichicWrapper:
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
         self.smiles_dict = self.initialize_smiles(smiles_list)
         torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         self.screen_df = virtual_screening(self.screen_df, 
                                            self.model, 
