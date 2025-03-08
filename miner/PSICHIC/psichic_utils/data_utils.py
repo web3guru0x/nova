@@ -343,7 +343,7 @@ def store_result(df, attention_dict, interaction_keys,  ligand_dict,
     return df
 
 def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=True, ligand_dict=None, device=device,
-                        save_cluster=False):
+                      save_cluster=False):
     if "ID" in screen_df.columns:
         # Iterate through the DataFrame check any empty pairs 
         for i, row in screen_df.iterrows():
@@ -358,23 +358,30 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
 
     model.eval()
     
+    # Create scaler for mixed precision if available
+    scaler = torch.amp.GradScaler('cuda') if device != "cpu" and hasattr(torch.amp, 'GradScaler') else None
+    use_amp = scaler is not None
+    
     with torch.no_grad():
         for data in tqdm(data_loader):
             data = data.to(device)
-            reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
-                    # Molecule
-                    mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
-                    atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
-                    clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
-                    # Protein
-                    residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
-                    residue_edge_index=data.prot_edge_index,
-                    residue_edge_weight=data.prot_edge_weight,
-                    # Mol-Protein Interaction batch
-                    mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
-                    # save_cluster
-                    save_cluster=save_cluster
-            )
+            
+            # Use automatic mixed precision for speedup if available
+            with torch.amp.autocast('cuda' if use_amp and device != "cpu" else 'cpu', enabled=use_amp):
+                reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
+                        # Molecule
+                        mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
+                        atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
+                        clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
+                        # Protein
+                        residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
+                        residue_edge_index=data.prot_edge_index,
+                        residue_edge_weight=data.prot_edge_weight,
+                        # Mol-Protein Interaction batch
+                        mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
+                        # save_cluster
+                        save_cluster=save_cluster
+                )
             interaction_keys = list(zip(data.prot_key, data.mol_key))
 
             if reg_pred is not None:
@@ -391,6 +398,6 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
 
             screen_df = store_result(screen_df, attention_dict, interaction_keys, ligand_dict, 
                                      reg_pred, cls_pred, mcls_pred, 
-                                     result_path=result_path, save_interpret = save_interpret)
+                                     result_path=result_path, save_interpret=save_interpret)
 
     return screen_df

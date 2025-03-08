@@ -21,6 +21,10 @@ class PsichicWrapper:
             self.model_config = json.load(f)
             
     def load_model(self):
+        # Enable cudnn benchmark for faster performance on fixed input sizes
+        if self.device != "cpu":
+            torch.backends.cudnn.benchmark = True
+            
         degree_dict = torch.load(os.path.join(self.runtime_config.MODEL_PATH,
                                               'degree.pt'), 
                                  weights_only=True
@@ -54,10 +58,6 @@ class PsichicWrapper:
                                               weights_only=True
                                               )
                                    )
-        print("🔹 CUDA Memory Allocated:", torch.cuda.memory_allocated() / 1e9, "GB")
-        print("🔹 CUDA Memory Reserved:", torch.cuda.memory_reserved() / 1e9, "GB")
-        print("🔹 CUDA Max Allocated:", torch.cuda.max_memory_allocated() / 1e9, "GB")
-
         
     def initialize_protein(self, protein_seq:str) -> dict:
         self.protein_seq = [protein_seq]
@@ -71,20 +71,28 @@ class PsichicWrapper:
     
     def create_screen_loader(self, protein_dict, smiles_dict):
         self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-                                       'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-                                       })
+                                    'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+                                    })
         
         dataset = ProteinMoleculeDataset(self.screen_df, 
-                                         smiles_dict, 
-                                         protein_dict, 
-                                         device=self.device
-                                         )
+                                        smiles_dict, 
+                                        protein_dict, 
+                                        device=self.device
+                                        )
+        
+        # Optimizări dataloader
+        num_workers = self.runtime_config.NUM_WORKERS if hasattr(self.runtime_config, 'NUM_WORKERS') else 16
+        prefetch_factor = self.runtime_config.PREFETCH_FACTOR if hasattr(self.runtime_config, 'PREFETCH_FACTOR') else 4
+        pin_memory = self.device != "cpu"
         
         self.screen_loader = DataLoader(dataset,
-                                        batch_size=self.runtime_config.BATCH_SIZE,
-                                        shuffle=False,
-                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
-                                        )
+                                    batch_size=self.runtime_config.BATCH_SIZE,
+                                    shuffle=False,
+                                    follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
+                                    num_workers=num_workers,
+                                    pin_memory=pin_memory,
+                                    prefetch_factor=prefetch_factor,
+                                    persistent_workers=True if num_workers > 0 else False)
         
     def run_challenge_start(self, protein_seq:str):
         torch.cuda.empty_cache()
@@ -94,16 +102,20 @@ class PsichicWrapper:
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
         self.smiles_dict = self.initialize_smiles(smiles_list)
         torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
-        self.screen_df = virtual_screening(self.screen_df, 
-                                           self.model, 
-                                           self.screen_loader,
-                                           os.getcwd(),
-                                           save_interpret=False,
-                                           ligand_dict=self.smiles_dict, 
-                                           device=self.device,
-                                           save_cluster=False,
-                                           )
-        return self.screen_df
         
+        # Enable mixed precision if supported and configured
+        use_amp = self.runtime_config.USE_MIXED_PRECISION if hasattr(self.runtime_config, 'USE_MIXED_PRECISION') and self.device != "cpu" else False
+        
+        # Use the updated autocast API
+        with torch.amp.autocast('cuda' if use_amp and self.device != "cpu" else 'cpu', enabled=use_amp):
+            self.screen_df = virtual_screening(self.screen_df, 
+                                            self.model, 
+                                            self.screen_loader,
+                                            os.getcwd(),
+                                            save_interpret=False,
+                                            ligand_dict=self.smiles_dict, 
+                                            device=self.device,
+                                            save_cluster=False,
+                                            )
+        return self.screen_df
