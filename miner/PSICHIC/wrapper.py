@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from .psichic_utils.dataset import ProteinMoleculeDataset
 from .psichic_utils.data_utils import DataLoader, virtual_screening
