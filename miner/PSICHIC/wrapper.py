@@ -98,42 +98,33 @@ class PsichicWrapper:
         torch.cuda.empty_cache()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         
-        # Import tqdm
-        from tqdm import tqdm
-        import numpy as np  # Add import here as well for redundancy
-        
-        # Create FP16 scaler for mixed precision - use new API
-        scaler = torch.amp.GradScaler(device_type='cuda')
-        
-        # Run with mixed precision
+        # Run without mixed precision since it's causing issues
         with torch.no_grad():
             reg_preds = []
             cls_preds = []
             mcls_preds = []
             interaction_keys_all = []
-            attention_dicts = []
             
             self.model.eval()
             
             for data in tqdm(self.screen_loader):
                 data = data.to(self.device)
                 
-                # Use mixed precision for faster computation - use new API
-                with torch.amp.autocast(device_type='cuda'):
-                    reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = self.model(
-                            # Molecule
-                            mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
-                            atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
-                            clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
-                            # Protein
-                            residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
-                            residue_edge_index=data.prot_edge_index,
-                            residue_edge_weight=data.prot_edge_weight,
-                            # Mol-Protein Interaction batch
-                            mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
-                            # save_cluster
-                            save_cluster=False
-                    )
+                # Run model without autocast to avoid compatibility issues
+                reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = self.model(
+                        # Molecule
+                        mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
+                        atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
+                        clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
+                        # Protein
+                        residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
+                        residue_edge_index=data.prot_edge_index,
+                        residue_edge_weight=data.prot_edge_weight,
+                        # Mol-Protein Interaction batch
+                        mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
+                        # save_cluster
+                        save_cluster=False
+                )
                 
                 interaction_keys = list(zip(data.prot_key, data.mol_key))
                 interaction_keys_all.extend(interaction_keys)
@@ -149,9 +140,7 @@ class PsichicWrapper:
                 if mcls_pred is not None:
                     mcls_pred = torch.softmax(mcls_pred,dim=-1).cpu().numpy()
                     mcls_preds.append(mcls_pred)
-                    
-                attention_dicts.append(attention_dict)
-                
+            
             # Combine results
             df_results = pd.DataFrame(interaction_keys_all, columns=['Protein', 'Ligand'])
             if reg_preds:
