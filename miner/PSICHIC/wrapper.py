@@ -17,7 +17,6 @@ class PsichicWrapper:
     def __init__(self):
         self.runtime_config = RuntimeConfig()
         self.device = self.runtime_config.DEVICE
-        self.results_cache = {}
         
         with open(os.path.join(self.runtime_config.MODEL_PATH, 'config.json'), 'r') as f:
             self.model_config = json.load(f)
@@ -80,7 +79,7 @@ class PsichicWrapper:
                                          device=self.device
                                          )
         
-        num_workers = 16  # Define it as a variable first
+        num_workers = 128  # Define it as a variable first
         bt.logging.success(f"Creating DataLoader with {num_workers} workers")
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
@@ -97,40 +96,18 @@ class PsichicWrapper:
         self.load_model()
         self.protein_dict = self.initialize_protein(protein_seq)
         
-    def run_validation(self, smiles_list):
-        # Filter out molecules we've already processed
-        uncached_smiles = [s for s in smiles_list if s not in self.results_cache]  # Use results_cache (with 's')
-        
-        if uncached_smiles:
-            # Only run inference on new molecules
-            self.screen_df = pd.DataFrame({
-                'Protein': [k for k in self.protein_seq for _ in uncached_smiles],
-                'Ligand': [l for l in uncached_smiles for _ in self.protein_seq],
-            })
-            
-            smiles_dict = self.initialize_smiles(uncached_smiles)
-            self.create_screen_loader(self.protein_dict, smiles_dict)
-            
-            new_results = virtual_screening(
-                self.screen_df, 
-                self.model, 
-                self.screen_loader,
-                os.getcwd(),
-                save_interpret=False,
-                ligand_dict=smiles_dict, 
-                device=self.device,
-                save_cluster=False
-            )
-            
-            # Update cache with new results
-            for _, row in new_results.iterrows():
-                self.results_cache[row['Ligand']] = row  # Use results_cache (with 's')
-        
-        # Build result DataFrame from cache
-        results = []
-        for smiles in smiles_list:
-            if smiles in self.results_cache:  # Use results_cache (with 's')
-                results.append(self.results_cache[smiles])  # Use results_cache (with 's')
-        
-        return pd.DataFrame(results) if results else pd.DataFrame()
+    def run_validation(self, smiles_list:list) -> pd.DataFrame:
+        self.smiles_dict = self.initialize_smiles(smiles_list)
+        torch.cuda.empty_cache()
+        self.create_screen_loader(self.protein_dict, self.smiles_dict)
+        self.screen_df = virtual_screening(self.screen_df, 
+                                           self.model, 
+                                           self.screen_loader,
+                                           os.getcwd(),
+                                           save_interpret=False,
+                                           ligand_dict=self.smiles_dict, 
+                                           device=self.device,
+                                           save_cluster=False,
+                                           )
+        return self.screen_df
         

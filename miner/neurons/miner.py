@@ -14,7 +14,6 @@ from substrateinterface import SubstrateInterface
 from datasets import load_dataset
 from huggingface_hub import list_repo_files
 import pandas as pd
-import time
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
@@ -26,7 +25,7 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 4096
+        self.chunk_size = 1024
         self.tolerance = 3
 
         self.config = self.get_config()
@@ -189,46 +188,44 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     async def run_psichic_model_loop(self):
+        """
+        Continuously runs the PSICHIC model on batches of molecules from the dataset.
+
+        This method streams random chunks of molecule data from a Hugging Face dataset,
+        processes them through the PSICHIC model to predict binding affinities, and updates
+        the best candidate when a higher scoring molecule is found. Runs in a separate thread
+        until the shutdown event is triggered.
+
+        The method:
+        1. Streams data in chunks from the dataset
+        2. Cleans the product names and SMILES strings
+        3. Runs PSICHIC predictions on each chunk
+        4. Updates the best candidate if a higher score is found
+        5. Continues until shutdown_event is set
+
+        Raises:
+            Exception: Logs any errors during execution and sets the shutdown event
+        """
         dataset = self.stream_random_chunk_from_dataset()
-        # Keep track of all processed molecules
-        all_processed_smiles = set()
-        
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    start_time = time.time()
-                    
                     df = pd.DataFrame.from_dict(chunk)
-                    df['product_name'] = df['product_name'].str.replace('"', '')
-                    df['product_smiles'] = df['product_smiles'].str.replace('"', '')
-                    
-                    # Only process unique molecules we haven't seen before
-                    unique_smiles = set(df['product_smiles'])
-                    new_smiles = list(unique_smiles - all_processed_smiles)
-                    
-                    if new_smiles:
-                        bt.logging.debug(f'Running inference on {len(new_smiles)} new molecules...')
-                        chunk_psichic_scores = self.psichic_wrapper.run_validation(new_smiles)
-                        all_processed_smiles.update(new_smiles)
-                        
-                        if not chunk_psichic_scores.empty:
-                            chunk_psichic_scores = chunk_psichic_scores.sort_values(
-                                by=self.psichic_result_column_name, 
-                                ascending=False
-                            ).reset_index(drop=True)
-                            
-                            if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                                async with self.shared_lock:
-                                    candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                                    self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                                    self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                                    bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                    
-                    total_time = time.time() - start_time
-                    bt.logging.info(f"Processed chunk in {total_time:.2f}s")
-                    
-                    await asyncio.sleep(0.1)
-                    
+                    df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
+                    df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
+                    # Run the PSICHIC model on the chunk.
+                    bt.logging.debug(f'Running inference...')
+                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                        async with self.shared_lock:
+                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                    #     await asyncio.sleep(0.5)
+                    # await asyncio.sleep(1.5)
+
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
                 self.shutdown_event.set()
