@@ -7,6 +7,7 @@ from typing import cast
 from types import SimpleNamespace
 import sys
 import torch
+import time
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
