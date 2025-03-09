@@ -99,7 +99,7 @@ class PsichicWrapper:
         
     def run_validation(self, smiles_list):
         # Filter out molecules we've already processed
-        uncached_smiles = [s for s in smiles_list if s not in self.result_cache]
+        uncached_smiles = [s for s in smiles_list if s not in self.results_cache]  # Use results_cache (with 's')
         
         if uncached_smiles:
             # Only run inference on new molecules
@@ -124,13 +124,13 @@ class PsichicWrapper:
             
             # Update cache with new results
             for _, row in new_results.iterrows():
-                self.result_cache[row['Ligand']] = row
+                self.results_cache[row['Ligand']] = row  # Use results_cache (with 's')
         
         # Build result DataFrame from cache
         results = []
         for smiles in smiles_list:
-            if smiles in self.result_cache:
-                results.append(self.result_cache[smiles])
+            if smiles in self.results_cache:  # Use results_cache (with 's')
+                results.append(self.results_cache[smiles])  # Use results_cache (with 's')
         
         return pd.DataFrame(results) if results else pd.DataFrame()
         
