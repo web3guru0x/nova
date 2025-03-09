@@ -14,7 +14,7 @@ from substrateinterface import SubstrateInterface
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
-from my_utils import get_sequence_from_protein_code
+from my_utils import get_smiles, get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
 from bittensor.core.chain_data.utils import decode_metadata
 
@@ -58,17 +58,22 @@ async def get_commitments(subtensor, metagraph, block_hash: str, netuid: int) ->
             )
     return result
 
-def run_model(protein: str, molecule: str) -> float:
+def run_model(protein: str, product_name: str) -> float:
     """Rulează modelul PSICHIC pentru a obține un scor."""
     try:
-        smiles = molecule  # Presupunem că molecule este deja un SMILES string
+        # Obține SMILES de la API
+        smiles = get_smiles(product_name)
+        if not smiles:
+            print(f"Nu s-a putut obține SMILES pentru '{product_name}'")
+            return 0.0
+
         results_df = psichic.run_validation([smiles])
         if results_df.empty:
             return 0.0
         predicted_score = results_df.iloc[0]['predicted_binding_affinity']
         return float(predicted_score) if predicted_score is not None else 0.0
     except Exception as e:
-        print(f"Eroare la rularea modelului: {e}")
+        print(f"Eroare la rularea modelului pentru {product_name}: {e}")
         return 0.0
 
 async def check_all_scores():
@@ -142,11 +147,12 @@ async def check_all_scores():
     # Evaluează fiecare commitment și afișează scorurile
     scores = []
     for hotkey, commit in current_epoch_commitments.items():
-        molecule = commit.data
+        product_name = commit.data
         uid = commit.uid
-        score = run_model(protein=current_protein, molecule=molecule)
+        # Rulăm modelul cu numele produsului
+        score = run_model(protein=current_protein, product_name=product_name)
         stake = metagraph.S[uid].item()
-        scores.append((uid, hotkey, molecule, score, stake, commit.block))
+        scores.append((uid, hotkey, product_name, score, stake, commit.block))
     
     # Sortează rezultatele după scor (descendent)
     scores.sort(key=lambda x: x[3], reverse=True)
