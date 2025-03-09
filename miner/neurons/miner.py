@@ -307,6 +307,7 @@ class Miner:
         try:
             # Start overall timer
             overall_start = profile_stage("START")
+            chunk_psichic_scores = None
             
             # Preprocess data
             preprocess_start = profile_stage("Preprocessing start")
@@ -332,7 +333,7 @@ class Miner:
             # Post-processing
             postprocess_start = profile_stage("Post-processing start")
             # Process results
-            if not chunk_psichic_scores.empty and self.psichic_result_column_name in chunk_psichic_scores.columns:
+            if chunk_psichic_scores is not None and not chunk_psichic_scores.empty and self.psichic_result_column_name in chunk_psichic_scores.columns:
                 # Sort results
                 chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
                 
