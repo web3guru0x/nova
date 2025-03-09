@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 import torch
+import bittensor as bt
 
 from .psichic_utils.dataset import ProteinMoleculeDataset
 from .psichic_utils.data_utils import DataLoader, virtual_screening
@@ -76,11 +77,13 @@ class PsichicWrapper:
                                          device=self.device
                                          )
         
+        num_workers = 128  # Define it as a variable first
+        bt.logging.success(f"Creating DataLoader with {num_workers} workers")
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
                                         shuffle=False,
                                         follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
-                                        num_workers=128,         # Mai mulți workers
+                                        num_workers=num_workers,         # Mai mulți workers
                                         prefetch_factor=32,      # Pre-încărcare extinsă
                                         pin_memory=True,
                                         persistent_workers=True
