@@ -15,3 +15,6 @@ tmux new -s miner 'python3 /workspace/nova/neurons/miner.py --wallet.name miner 
 
 
 python3 neurons/miner.py --wallet.name miner --wallet.hotkey default --logging.debug --network ws://178.63.86.244:9944
+
+
+GITHUB TOKEN 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

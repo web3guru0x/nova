@@ -267,7 +267,7 @@ class Miner:
                     if random.random() < 0.05:  # 5% chance to clean up
                         empty_gpu_cache()
                         
-                    await asyncio.sleep(1)  # Reduced sleep time for faster throughput
+                    await asyncio.sleep(0.1)  # Reduced sleep time for faster throughput
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
@@ -397,7 +397,7 @@ class Miner:
                                 bt.logging.info(f'Too soon to commit again, will keep looking for better candidates.')
                             except Exception as e:
                                 bt.logging.error(e)
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.1)
 
                 # Periodically update our knowledge of the network graph.
                 if self.current_block % 60 == 0:
