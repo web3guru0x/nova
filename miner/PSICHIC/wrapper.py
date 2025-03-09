@@ -16,17 +16,24 @@ class PsichicWrapper:
     def __init__(self):
         self.runtime_config = RuntimeConfig()
         # Forțează utilizarea CUDA dacă este disponibil
-        self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        self.runtime_config.DEVICE = self.device
-        
-        # Afișează informații despre CUDA pentru diagnostic
-        if torch.cuda.is_available():
-            print(f"CUDA available: {torch.cuda.is_available()}")
-            print(f"CUDA device count: {torch.cuda.device_count()}")
-            print(f"CUDA device name: {torch.cuda.get_device_name(0)}")
-            print(f"Using device: {self.device}")
+        cuda_available = torch.cuda.is_available()
+        if cuda_available:
+            cuda_device_count = torch.cuda.device_count()
+            cuda_device_name = torch.cuda.get_device_name(0)
+            print(f"CUDA available: {cuda_available}, Device count: {cuda_device_count}, Device name: {cuda_device_name}")
+            # Print memory information
+            print(f"GPU total memory: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB")
+            # Set GPU optimization flags
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Set CUDA device to 0
+            torch.cuda.set_device(0)
         else:
             print("CUDA not available, using CPU")
+            
+        self.device = "cuda:0" if cuda_available else "cpu"
+        self.runtime_config.DEVICE = self.device
         
         with open(os.path.join(self.runtime_config.MODEL_PATH, 'config.json'), 'r') as f:
             self.model_config = json.load(f)
@@ -89,23 +96,25 @@ class PsichicWrapper:
     
     def create_screen_loader(self, protein_dict, smiles_dict):
         self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-                                       'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-                                       })
+                                    'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+                                    })
         
         dataset = ProteinMoleculeDataset(self.screen_df, 
-                                         smiles_dict, 
-                                         protein_dict, 
-                                         device=self.device
-                                         )
+                                        smiles_dict, 
+                                        protein_dict, 
+                                        device=self.device
+                                        )
         
+        # Optimize the DataLoader for GPU throughput
         self.screen_loader = DataLoader(dataset,
-                                        batch_size=self.runtime_config.BATCH_SIZE,
+                                        batch_size=min(4096, len(dataset)),  # Smaller batch size to avoid OOM
                                         shuffle=False,
                                         follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
-                                        pin_memory=True,  # Adaugă pin_memory
-                                        num_workers=2,    # Adaugă workers pentru încărcare paralelă
-                                        prefetch_factor=2 # Prefetch factor pentru suprapunere
-                                        )
+                                        pin_memory=True,
+                                        num_workers=4,  # Increase worker count
+                                        prefetch_factor=4,
+                                        persistent_workers=True  # Keep workers alive between batches
+                                    )
         
     def run_challenge_start(self, protein_seq:str):
         torch.cuda.empty_cache()
@@ -126,29 +135,25 @@ class PsichicWrapper:
             raise
         
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
-        # Golește cache-ul înainte de a începe inferența
+        # Clean GPU memory
         if self.device != "cpu" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        # Creează un dicționar de SMILES pe GPU
+        # Create dictionary on GPU directly
         self.smiles_dict = self.initialize_smiles(smiles_list)
         
-        # Creează un dataloader optimizat pentru GPU
+        # Create optimized dataloader
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         
-        # Configurează procesarea cu precizie mixtă pentru performanță
-        use_amp = True if self.device != "cpu" and torch.cuda.is_available() else False
+        # Configure mixed precision for better GPU utilization
+        scaler = torch.cuda.amp.GradScaler() if self.device != "cpu" else None
         
-        # Rulează printr-un CUDA stream dedicat
+        # Run inference through a dedicated CUDA stream for better GPU utilization
         if self.device != "cpu" and torch.cuda.is_available():
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
-                with torch.amp.autocast(device_type='cuda', enabled=use_amp):
-                    # Adaugă prefetch pentru a suprapune procesarea CPU/GPU
-                    self.screen_loader.prefetch_factor = 2 if hasattr(self.screen_loader, 'prefetch_factor') else None
-                    
-                    # Procesează datele
+                with torch.amp.autocast(device_type='cuda', enabled=True):
                     self.screen_df = virtual_screening(
                         self.screen_df, 
                         self.model, 
@@ -159,8 +164,6 @@ class PsichicWrapper:
                         device=self.device,
                         save_cluster=False,
                     )
-                    
-                # Asigură-te că operațiunile GPU sunt complete
                 torch.cuda.synchronize()
         else:
             self.screen_df = virtual_screening(

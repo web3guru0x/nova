@@ -350,7 +350,7 @@ def store_result(df, attention_dict, interaction_keys, ligand_dict,
                         )
     return df
 
-def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=True, ligand_dict=None, device=device, save_cluster=False):
+def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=False, ligand_dict=None, device=device, save_cluster=False):
     """
     Funcție care rulează inferența pentru screening virtual, optimizată pentru utilizare GPU.
     
@@ -426,7 +426,7 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
                                 save_cluster=save_cluster
                         )
                     
-                    # Forțează sincronizarea pentru a finaliza operațiile GPU
+                    # Forțează sincronizarea pentru a finaliza operațiunile GPU
                     torch.cuda.synchronize()
             else:
                 # Inferența pe CPU (fără optimizări CUDA)

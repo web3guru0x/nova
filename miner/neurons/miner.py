@@ -222,67 +222,59 @@ class Miner:
     async def run_psichic_model_loop(self):
         dataset = self.stream_random_chunk_from_dataset()
         
-        # Configurează CUDA pentru performanță
+        # Set crucial environment variables for GPU performance
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Prioritizează operațiunile CUDA față de CPU
-            os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+            # Force synchronous CUDA for debugging if needed
+            # os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
             
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    # Monitorizează memoria GPU periodic
-                    if torch.cuda.is_available() and random.random() < 0.05:
-                        self.monitor_gpu_usage()
-                    
-                    # Preprocesează datele în mod eficient
-                    preprocess_start = time.time()
+                    # Process in smaller batches to avoid CUDA initialization errors
+                    batch_size = min(4096, len(chunk['product_smiles']))
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    preprocess_end = time.time()
-                    bt.logging.debug(f"Data preprocessing took {preprocess_end - preprocess_start:.3f} seconds for {len(df)} molecules")
                     
-                    try:
-                        # Inferență GPU-optimizată
-                        inference_start = time.time()
-                        bt.logging.debug(f'Running inference on batch of {len(df)} molecules...')
+                    # Process in smaller chunks to avoid CUDA errors
+                    for i in range(0, len(df), batch_size):
+                        batch_df = df.iloc[i:i+batch_size]
+                        bt.logging.debug(f'Running inference on batch {i//batch_size + 1} of {len(df)//batch_size + 1} (size: {len(batch_df)})')
                         
-                        if torch.cuda.is_available():
-                            with torch.cuda.amp.autocast(enabled=True):
-                                chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                        else:
-                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                        try:
+                            # Use GPU optimized inference
+                            if torch.cuda.is_available():
+                                with torch.cuda.amp.autocast(enabled=True):
+                                    chunk_psichic_scores = self.psichic_wrapper.run_validation(batch_df['product_smiles'].tolist())
+                            else:
+                                chunk_psichic_scores = self.psichic_wrapper.run_validation(batch_df['product_smiles'].tolist())
+                            
+                            # Process results
+                            if not chunk_psichic_scores.empty:
+                                chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                                
+                                if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                                    async with self.shared_lock:
+                                        candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                                        self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                                        self.candidate_product = batch_df.loc[batch_df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                                        bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                            
+                            # Always clean GPU memory after each batch
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                                
+                        except Exception as e:
+                            bt.logging.error(f"Error in batch processing: {e}")
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
                         
-                        inference_time = time.time() - inference_start
-                        bt.logging.info(f"Inference completed in {inference_time:.3f}s ({len(df)/inference_time:.1f} molecules/s)")
-                        
-                        # Procesează rezultatele
-                        chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                        
-                        if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                            async with self.shared_lock:
-                                # Salvează candidatul
-                                candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                                self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                                self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                                bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                        # Allow other async tasks to run
+                        await asyncio.sleep(0.01)
                     
-                    except Exception as e:
-                        bt.logging.error(f"Error in batch processing: {e}")
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    
-                    # Evită blocarea event loop-ului
-                    await asyncio.sleep(0.01)
-                    
-                    # Curăță memoria GPU periodic
-                    if torch.cuda.is_available() and random.random() < 0.1:
-                        torch.cuda.empty_cache()
-
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
                 if torch.cuda.is_available():
