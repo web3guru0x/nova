@@ -190,42 +190,53 @@ class Miner:
     async def run_psichic_model_loop(self):
         """
         Continuously runs the PSICHIC model on batches of molecules from the dataset.
-
+        
         This method streams random chunks of molecule data from a Hugging Face dataset,
         processes them through the PSICHIC model to predict binding affinities, and updates
         the best candidate when a higher scoring molecule is found. Runs in a separate thread
         until the shutdown event is triggered.
-
-        The method:
-        1. Streams data in chunks from the dataset
-        2. Cleans the product names and SMILES strings
-        3. Runs PSICHIC predictions on each chunk
-        4. Updates the best candidate if a higher score is found
-        5. Continues until shutdown_event is set
-
-        Raises:
-            Exception: Logs any errors during execution and sets the shutdown event
         """
         dataset = self.stream_random_chunk_from_dataset()
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
+                    # Create DataFrame directly with cleaned data to avoid apply operations
                     df = pd.DataFrame.from_dict(chunk)
-                    df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
-                    df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    # Run the PSICHIC model on the chunk.
-                    bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                    
+                    # 1. Use vectorized operations instead of apply
+                    df['product_name'] = df['product_name'].str.replace('"', '')
+                    df['product_smiles'] = df['product_smiles'].str.replace('"', '')
+                    
+                    # 2. Get unique SMILES strings to avoid redundant processing
+                    unique_smiles = df['product_smiles'].unique().tolist()
+                    
+                    # 3. Run the PSICHIC model on unique molecules only
+                    bt.logging.debug(f'Running inference on {len(unique_smiles)} unique molecules...')
+                    chunk_psichic_scores = self.psichic_wrapper.run_validation(unique_smiles)
+                    
+                    # 4. Sort efficiently
+                    chunk_psichic_scores = chunk_psichic_scores.sort_values(
+                        by=self.psichic_result_column_name, 
+                        ascending=False
+                    ).reset_index(drop=True)
+                    
+                    # 5. Check if we have a better candidate
+                    if (not chunk_psichic_scores.empty and 
+                        chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score):
                         async with self.shared_lock:
                             candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
                             self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                            
+                            # 6. Use more efficient lookup with a merge instead of loc
+                            # Create a mapping for faster lookup
+                            molecule_to_product = dict(zip(df['product_smiles'], df['product_name']))
+                            self.candidate_product = molecule_to_product.get(candidate_molecule)
+                            
                             bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                    #     await asyncio.sleep(0.5)
-                    # await asyncio.sleep(1.5)
-
+                    
+                    # 7. Only sleep briefly between chunks to allow other tasks to run
+                    await asyncio.sleep(0.1)
+                    
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
                 self.shutdown_event.set()
