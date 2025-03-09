@@ -5,14 +5,14 @@
     "mclassification_task": 0
   },
   "optimizer": {
-    "lrate": 0.0003,
-    "weight_decay": 0.0005,
+    "lrate": 0.0002,
+    "weight_decay": 0.0006,
     "clip": 2.0,
     "betas": [0.9, 0.999],
     "eps": 1e-8,
     "schedule_lr": true,
     "min_lrate": 0.00001,
-    "warmup_iters": 200,
+    "warmup_iters": 500,
     "lr_decay_iters": 500,
     "amsgrad": true
   },
@@ -20,15 +20,15 @@
     "mol_in_channels": 43,
     "prot_in_channels": 33,
     "prot_evo_channels": 1280,
-    "hidden_channels": 1024,
+    "hidden_channels": 2048,
     "aggregators": ["mean", "min", "max", "std", "sum"],
     "scalers": ["identity", "amplification", "linear", "attenuation"],
-    "pre_layers": 5,
-    "post_layers": 4,
-    "total_layer": 8,
-    "K": [20, 40, 60, 80, 100, 120],
-    "dropout": 0.3,
-    "dropout_attn_score": 0.4,
-    "heads": 16
+    "pre_layers": 8,
+    "post_layers": 6,
+    "total_layer": 12,
+    "K": [50, 100, 150, 200, 250, 300],
+    "dropout": 0.4,
+    "dropout_attn_score": 0.5,
+    "heads": 32
   }
 }
