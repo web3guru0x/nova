@@ -79,7 +79,11 @@ class PsichicWrapper:
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
                                         shuffle=False,
-                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
+                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
+                                        num_workers=24,         # Mai mulți workers
+                                        prefetch_factor=8,      # Pre-încărcare extinsă
+                                        pin_memory=True,
+                                        persistent_workers=True
                                         )
         
     def run_challenge_start(self, protein_seq:str):
