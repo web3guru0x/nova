@@ -71,6 +71,7 @@ class PsichicWrapper:
                                        'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
                                        })
         
+        bt.logging.success(f"Creating dataset")
         dataset = ProteinMoleculeDataset(self.screen_df, 
                                          smiles_dict, 
                                          protein_dict, 
