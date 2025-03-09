@@ -16,7 +16,7 @@ apt update && apt install -y tmux
 
 tmux new -s miner 'python3 /workspace/nova/neurons/miner.py --wallet.name miner --wallet.hotkey default --logging.debug 2>&1 | tee miner.log'
 
-tmux a -t <session-name>
+tmux a -t miner
 
 python3 neurons/miner.py --wallet.name miner --wallet.hotkey default --logging.debug --network ws://178.63.86.244:9944
 
