@@ -45,11 +45,8 @@ RUN echo "WALLET_NAME=main\nWALLET_HOTKEY=default\nSUBTENSOR_NETWORK=finney\nRUN
 # Instalăm dependențele Nova (inclusiv PyTorch și Bittensor)
 RUN cd /workspace/nova && export PATH=$HOME/.local/bin:$PATH && bash install_deps_cu124.sh || echo "Install script failed, continuing..."
 
-# Asigurăm că GPU-ul este recunoscut corect
-CMD ["nvidia-smi"]
-
 # Setăm un proces activ pentru a preveni shutdown instant
 ENTRYPOINT ["/bin/bash", "-c", "tail -f /dev/null"]
 
 # CMD implicit pentru debugging
-CMD ["/bin/bash"]
+CMD ["nvidia-smi", "/bin/bash"]
