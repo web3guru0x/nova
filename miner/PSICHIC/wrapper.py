@@ -80,8 +80,8 @@ class PsichicWrapper:
                                         batch_size=self.runtime_config.BATCH_SIZE,
                                         shuffle=False,
                                         follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
-                                        num_workers=32,         # Mai mulți workers
-                                        prefetch_factor=16,      # Pre-încărcare extinsă
+                                        num_workers=128,         # Mai mulți workers
+                                        prefetch_factor=32,      # Pre-încărcare extinsă
                                         pin_memory=True,
                                         persistent_workers=True
                                         )
