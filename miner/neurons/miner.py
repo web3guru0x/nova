@@ -30,6 +30,15 @@ from gpu_utils import optimize_memory_for_inference, CudaStreamPool, BatchProces
 from my_utils import get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
 
+# Try to optimize CUDA settings
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+    pynvml.nvmlDeviceSetApplicationsClocks(handle, 1530, 1410)  # Set memory and graphics clocks
+except:
+    bt.logging.warning("Could not set CUDA device clocks - continuing without optimization")
+
 class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
@@ -284,8 +293,21 @@ class Miner:
             
             # Process batch with PSICHIC wrapper
             with gpu_timer(f"Processing batch of {len(df)} molecules"):
-                with torch.cuda.amp.autocast():
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                if hasattr(torch, 'profiler'):
+                    with torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+                        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+                        record_shapes=True,
+                        with_stack=True
+                    ) as prof:
+                        with torch.cuda.amp.autocast():
+                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                        prof.step()
+                else:
+                    # Fallback if profiler not available
+                    with torch.cuda.amp.autocast():
+                        chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
             
             # Record processing time
             elapsed_time = time.time() - start_time

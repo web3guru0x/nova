@@ -159,14 +159,13 @@ class PsichicWrapper:
         
         # Use optimized data loader with pinned memory and multiple workers
         self.screen_loader = DataLoader(dataset,
-                                        batch_size=self.runtime_config.BATCH_SIZE,
-                                        shuffle=False,
-                                        pin_memory=True,
-                                        num_workers=4,  # Use multiple workers for faster data loading
-                                        persistent_workers=True,  # Keep workers alive between batches
-                                        prefetch_factor=3,  # Prefetch more batches
-                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
-                                        )
+                               batch_size=self.runtime_config.BATCH_SIZE,
+                               shuffle=False,
+                               pin_memory=True,
+                               num_workers=8,  # Increase from 4 to 8
+                               persistent_workers=True,
+                               prefetch_factor=5,  # Increase from 3 to 5
+                               follow_batch=['mol_x', 'clique_x', 'prot_node_aa'])
         
     def run_challenge_start(self, protein_seq:str):
         # Track timing
@@ -206,7 +205,7 @@ class PsichicWrapper:
         for i, stream in enumerate(self.streams):
             with torch.cuda.stream(stream):
                 # Use mixed precision for faster computation
-                with torch.cuda.amp.autocast(enabled=self.runtime_config.USE_MIXED_PRECISION):
+                with torch.cuda.amp.autocast(enabled=self.runtime_config.USE_MIXED_PRECISION, dtype=torch.float16):
                     # Process subset of loader
                     subset_loader = [batch for j, batch in enumerate(self.screen_loader) if j % len(self.streams) == i]
                     if subset_loader:
