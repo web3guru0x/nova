@@ -20,7 +20,7 @@
     "mol_in_channels": 43,
     "prot_in_channels": 33,
     "prot_evo_channels": 1280,
-    "hidden_channels": 6144,
+    "hidden_channels": 8192,
     "aggregators": ["mean", "min", "max", "std", "sum", "max_std"],
     "scalers": [
       "identity",
@@ -33,8 +33,8 @@
     "post_layers": 14,
     "total_layer": 28,
     "K": [200, 400, 600, 800, 1000, 1200],
-    "dropout": 0.6,
-    "dropout_attn_score": 0.7,
-    "heads": 96
+    "dropout": 0.5,
+    "dropout_attn_score": 0.5,
+    "heads": 128
   }
 }
