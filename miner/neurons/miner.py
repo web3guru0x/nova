@@ -188,53 +188,44 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     async def run_psichic_model_loop(self):
-        """
-        Continuously runs the PSICHIC model on batches of molecules from the dataset.
-        
-        This method streams random chunks of molecule data from a Hugging Face dataset,
-        processes them through the PSICHIC model to predict binding affinities, and updates
-        the best candidate when a higher scoring molecule is found. Runs in a separate thread
-        until the shutdown event is triggered.
-        """
+        """Continuously runs the PSICHIC model on batches of molecules from the dataset."""
         dataset = self.stream_random_chunk_from_dataset()
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    # Create DataFrame directly with cleaned data to avoid apply operations
-                    df = pd.DataFrame.from_dict(chunk)
+                    start_time = time.time()
                     
-                    # 1. Use vectorized operations instead of apply
+                    # Create dataframe
+                    df_time_start = time.time()
+                    df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].str.replace('"', '')
                     df['product_smiles'] = df['product_smiles'].str.replace('"', '')
+                    df_time = time.time() - df_time_start
                     
-                    # 2. Get unique SMILES strings to avoid redundant processing
-                    unique_smiles = df['product_smiles'].unique().tolist()
+                    # Run inference
+                    inference_time_start = time.time()
+                    bt.logging.debug(f'Running inference...')
+                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    inference_time = time.time() - inference_time_start
                     
-                    # 3. Run the PSICHIC model on unique molecules only
-                    bt.logging.debug(f'Running inference on {len(unique_smiles)} unique molecules...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(unique_smiles)
-                    
-                    # 4. Sort efficiently
+                    # Process results
+                    processing_time_start = time.time()
                     chunk_psichic_scores = chunk_psichic_scores.sort_values(
                         by=self.psichic_result_column_name, 
                         ascending=False
                     ).reset_index(drop=True)
                     
-                    # 5. Check if we have a better candidate
-                    if (not chunk_psichic_scores.empty and 
-                        chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score):
+                    if not chunk_psichic_scores.empty and chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                         async with self.shared_lock:
                             candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
                             self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            
-                            # 6. Use more efficient lookup with a merge instead of loc
-                            # Create a mapping for faster lookup
-                            molecule_to_product = dict(zip(df['product_smiles'], df['product_name']))
-                            self.candidate_product = molecule_to_product.get(candidate_molecule)
-                            
+                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
                             bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                    processing_time = time.time() - processing_time_start
                     
-                    # 7. Only sleep briefly between chunks to allow other tasks to run
+                    total_time = time.time() - start_time
+                    bt.logging.info(f"Timing: Total={total_time:.2f}s | DataFrame={df_time:.2f}s | Inference={inference_time:.2f}s | Processing={processing_time:.2f}s")
+                    
                     await asyncio.sleep(0.1)
                     
             except Exception as e:
