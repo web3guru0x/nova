@@ -41,7 +41,7 @@ def setup_gpu_for_h200():
     torch.backends.cudnn.deterministic = False
     
     # Set memory allocation strategy - increased chunk size for better performance
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:1024,garbage_collection_threshold:0.9'
     
     # Preallocate memory to reduce fragmentation - larger for H200's 141GB VRAM
     try:
@@ -184,7 +184,7 @@ def optimize_memory_for_inference(max_batch_size=None, num_warmup_iterations=2):
             logger.warning(f"Failed to reserve memory: {e}")
     
     # Set PyTorch to release memory more aggressively
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,garbage_collection_threshold:0.8'
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:1024,garbage_collection_threshold:0.9'
     
     # Run garbage collection
     gc.collect()

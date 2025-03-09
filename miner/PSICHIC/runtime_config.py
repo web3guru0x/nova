@@ -11,9 +11,9 @@ class RuntimeConfig:
     DEVICE = "cuda:0"
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
     # Significantly increased batch size for H200 SXM with 141GB VRAM
-    BATCH_SIZE = 4096
+    BATCH_SIZE = 8192
     # Number of parallel streams for GPU processing
-    NUM_CUDA_STREAMS = 3
+    NUM_CUDA_STREAMS = 6
     # Use mixed precision for faster computation
     USE_MIXED_PRECISION = True
     # Memory efficient attention for transformer-based models
