@@ -221,9 +221,6 @@ class Miner:
 
     async def run_psichic_model_loop(self):
         dataset = self.stream_random_chunk_from_dataset()
-
-        # Call monitor at start to check initial state
-        self.monitor_gpu_usage()
         
         # Ensure CUDA is properly configured
         if torch.cuda.is_available():
@@ -240,7 +237,7 @@ class Miner:
                     if torch.cuda.is_available():
                         # Check GPU utilization periodically
                         if random.random() < 0.05:  # 5% of batches
-                            bt.logging.debug(f"GPU Memory in use: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+                            self.monitor_gpu_usage()
                     
                     # Start timing for data preprocessing
                     preprocess_start = time.time()
@@ -263,13 +260,33 @@ class Miner:
                         
                         # CRITICAL: Use CUDA profiling to ensure GPU is utilized
                         if torch.cuda.is_available():
-                            with torch.cuda.profiler.profile():
-                                with torch.cuda.stream(torch.cuda.Stream()):
-                                    with torch.autograd.profiler.emit_nvtx():
-                                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                                        # Force CUDA synchronization
-                                        torch.cuda.synchronize()
+                            # Create a dedicated CUDA stream
+                            stream = torch.cuda.Stream()
+                            with torch.cuda.stream(stream):
+                                # Use autocast for mixed precision operations
+                                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                                    # Add profiling to identify bottlenecks
+                                    with torch.profiler.profile(
+                                        activities=[
+                                            torch.profiler.ProfilerActivity.CPU,
+                                            torch.profiler.ProfilerActivity.CUDA
+                                        ],
+                                        schedule=torch.profiler.schedule(
+                                            wait=10, warmup=10, active=20, repeat=1
+                                        ),
+                                        record_shapes=True,
+                                        with_stack=True,
+                                        profile_memory=True,
+                                    ) as prof:
+                                        chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                                    
+                                    # Force CUDA synchronization to ensure all operations complete
+                                    torch.cuda.synchronize()
+                                
+                            # Optionally, print profiling results to identify bottlenecks
+                            if random.random() < 0.01:  # 1% chance
+                                bt.logging.info("GPU Profiling Results:")
+                                bt.logging.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
                         else:
                             chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                         
@@ -277,9 +294,9 @@ class Miner:
                         inference_time = inference_end - inference_start
                         molecules_per_second = len(df) / inference_time
                         
-                        bt.logging.info(f"GPU Inference completed in {inference_time:.3f} seconds, processing {molecules_per_second:.2f} molecules/second")
+                        bt.logging.info(f"Inference completed in {inference_time:.3f} seconds, processing {molecules_per_second:.2f} molecules/second")
                         
-                        # Further processing with results
+                        # Process results
                         chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
                         
                         if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
@@ -295,7 +312,7 @@ class Miner:
                             torch.cuda.empty_cache()
                     
                     # Short sleep to prevent blocking the event loop
-                    await asyncio.sleep(0.01)  # Reduced sleep time for faster processing
+                    await asyncio.sleep(0.01)  # Very short sleep time to maximize throughput
                     
                     # Periodically cleanup to prevent memory issues
                     if torch.cuda.is_available() and random.random() < 0.05:  # 5% chance
