@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
 from dotenv import load_dotenv
-import torch
 
 load_dotenv()
 
@@ -10,11 +9,5 @@ class RuntimeConfig:
     device = os.environ.get("DEVICE_OVERRIDE")
     DEVICE = "cuda:0"  # Forțat pe primul GPU
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
-    BATCH_SIZE = 4096  # Increased from 4096
-    MODEL_CACHE = True  # Added for memory caching
+    BATCH_SIZE = 4096
     
-    # Enable CUDA optimizations
-    if torch.cuda.is_available():
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True

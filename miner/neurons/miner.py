@@ -14,8 +14,6 @@ from substrateinterface import SubstrateInterface
 from datasets import load_dataset
 from huggingface_hub import list_repo_files
 import pandas as pd
-from tqdm import tqdm
-import numpy as np
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
@@ -27,10 +25,8 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 4096  # Increased from 2048
+        self.chunk_size = 2048
         self.tolerance = 3
-        self.high_score_threshold = 9.0  # New threshold for early submission
-        self.num_parallel_inferences = 4  # Number of parallel inference tasks
 
         self.config = self.get_config()
         node = SubstrateInterface(url=self.config.network)
@@ -45,7 +41,7 @@ class Miner:
         self.best_score = 0
         self.last_submitted_product = None
         self.shared_lock = asyncio.Lock()
-        self.inference_tasks = []
+        self.inference_task = None
         self.shutdown_event = asyncio.Event()
 
     def get_config(self):
@@ -191,56 +187,48 @@ class Miner:
         )
         return highest_stake_commit.data if highest_stake_commit else None
 
-    async def run_psichic_model_loop(self, task_id=0):
+    async def run_psichic_model_loop(self):
         """
         Continuously runs the PSICHIC model on batches of molecules from the dataset.
-        This version supports parallel execution with task_id for identification.
+
+        This method streams random chunks of molecule data from a Hugging Face dataset,
+        processes them through the PSICHIC model to predict binding affinities, and updates
+        the best candidate when a higher scoring molecule is found. Runs in a separate thread
+        until the shutdown event is triggered.
+
+        The method:
+        1. Streams data in chunks from the dataset
+        2. Cleans the product names and SMILES strings
+        3. Runs PSICHIC predictions on each chunk
+        4. Updates the best candidate if a higher score is found
+        5. Continues until shutdown_event is set
+
+        Raises:
+            Exception: Logs any errors during execution and sets the shutdown event
         """
         dataset = self.stream_random_chunk_from_dataset()
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    if self.shutdown_event.is_set():
-                        break
-                        
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    
                     # Run the PSICHIC model on the chunk.
-                    bt.logging.debug(f'Task {task_id} running inference...')
+                    bt.logging.debug(f'Running inference...')
                     chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                     chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                    
                     if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                         async with self.shared_lock:
                             candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                            new_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            self.best_score = new_score
+                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
                             self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                            bt.logging.info(f"Task {task_id} found new best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                            
-                            # Submit immediately if score exceeds threshold
-                            if new_score > self.high_score_threshold and self.candidate_product != self.last_submitted_product:
-                                try:
-                                    await self.subtensor.set_commitment(
-                                        wallet=self.wallet,
-                                        netuid=self.config.netuid,
-                                        data=self.candidate_product
-                                    )
-                                    self.last_submitted_product = self.candidate_product
-                                    bt.logging.info(f'High score detected! Submitted product: {self.candidate_product} with score: {new_score}')
-                                except Exception as e:
-                                    bt.logging.error(f"Error submitting high-score candidate: {e}")
-                                    
-                        await asyncio.sleep(0.2)  # Shorter sleep for high scores
-                    else:
-                        await asyncio.sleep(0.5)  # Normal sleep between iterations
+                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                        await asyncio.sleep(0.5)
+                    await asyncio.sleep(1.5)
 
             except Exception as e:
-                bt.logging.error(f"Error in inference task {task_id}: {e}")
-                # Don't shut down all tasks if one fails
-                await asyncio.sleep(5)  # Wait before trying again
+                bt.logging.error(f"Error running PSICHIC model: {e}")
+                self.shutdown_event.set()
 
     async def run(self):
         # The Main Mining Loop.
@@ -264,14 +252,11 @@ class Miner:
                 bt.logging.error(f"Error initializing model: {e}")
 
             try:
-                # Start multiple inference tasks
-                self.inference_tasks = []
-                for i in range(self.num_parallel_inferences):
-                    task = asyncio.create_task(self.run_psichic_model_loop(task_id=i))
-                    self.inference_tasks.append(task)
-                bt.logging.debug(f'Started {self.num_parallel_inferences} parallel inference tasks on startup')
+                self.inference_task = asyncio.create_task(self.run_psichic_model_loop())
+                bt.logging.debug("Inference started on startup protein.")
             except Exception as e:
                 bt.logging.error(f"Error starting inference: {e}")
+
 
         while True:
             try:
@@ -285,29 +270,18 @@ class Miner:
                         self.last_challenge_protein = new_protein
                         bt.logging.info(f"New protein: {new_protein}")
 
-                    # If old tasks still running, set shutdown event
-                    if self.inference_tasks:
-                        self.shutdown_event.set()
-                        bt.logging.debug(f"Shutdown event set for old inference tasks.")
-                        
-                        # Wait for tasks to complete
-                        for task in self.inference_tasks:
-                            if not task.done():
-                                try:
-                                    await asyncio.wait_for(task, timeout=5.0)
-                                except asyncio.TimeoutError:
-                                    bt.logging.warning("Timeout waiting for inference task to complete")
-                        
-                        # Reset state
-                        self.candidate_product = None
-                        self.candidate_product_score = 0
-                        self.best_score = 0
-                        self.last_submitted_product = None
-                        self.shutdown_event = asyncio.Event()
-                        self.inference_tasks = []
+                    # If old task still running, set shutdown event
+                    if self.inference_task:
+                        if not self.inference_task.done():
+                            self.shutdown_event.set()
+                            bt.logging.debug(f"Shutdown event set for old inference task.")
 
-                    # Free memory before starting new inference
-                    torch.cuda.empty_cache()
+                            # reset old values for best score, etc
+                            self.candidate_product = None
+                            self.candidate_product_score = 0
+                            self.best_score = 0
+                            self.last_submitted_product = None
+                            self.shutdown_event = asyncio.Event()
 
                     # Get protein sequence from uniprot
                     protein_sequence = get_sequence_from_protein_code(self.current_challenge_protein)
@@ -325,15 +299,13 @@ class Miner:
                         except Exception as e:
                             bt.logging.error(f'Error initializing model: {e}')
 
-                    # Start multiple inference tasks
+                    # Start inference loop
                     try:
-                        self.inference_tasks = []
-                        for i in range(self.num_parallel_inferences):
-                            task = asyncio.create_task(self.run_psichic_model_loop(task_id=i))
-                            self.inference_tasks.append(task)
-                        bt.logging.debug(f'Started {self.num_parallel_inferences} parallel inference tasks')
+                        self.inference_task = asyncio.create_task(self.run_psichic_model_loop())
+                        bt.logging.debug(f'Inference task started successfully')
                     except Exception as e:
-                        bt.logging.error(f'Error initializing inference tasks: {e}')
+                        bt.logging.error(f'Error initializing inference: {e}')
+
 
                 # Check if candidate product has changed
                 async with self.shared_lock:
@@ -353,58 +325,26 @@ class Miner:
                             except MetadataError as e:
                                 bt.logging.info(f'Too soon to commit again, will keep looking for better candidates.')
                             except Exception as e:
-                                bt.logging.error(f'Error submitting commitment: {e}')
-                
-                # Shorter sleep times for more responsiveness
-                await asyncio.sleep(0.5)
+                                bt.logging.error(e)
+                await asyncio.sleep(1)
 
                 # Periodically update our knowledge of the network graph.
                 if self.current_block % 60 == 0:
                     await self.metagraph.sync()
-                    # Log GPU memory stats for monitoring
-                    if torch.cuda.is_available():
-                        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-                        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                        max_mem = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                        gpu_util = torch.cuda.utilization()
-                        
-                        log = (
-                            f'Block: {self.metagraph.block.item()} | '
-                            f'Number of nodes: {self.metagraph.n} | '
-                            f'Current epoch: {self.metagraph.block.item() // self.epoch_length} | '
-                            f'GPU Memory: {allocated:.2f}GB/{max_mem:.2f}GB (reserved: {reserved:.2f}GB) | '
-                            f'GPU Utilization: {gpu_util}%'
-                        )
-                    else:
-                        log = (
-                            f'Block: {self.metagraph.block.item()} | '
-                            f'Number of nodes: {self.metagraph.n} | '
-                            f'Current epoch: {self.metagraph.block.item() // self.epoch_length}'
-                        )
+                    log = (
+                        f'Block: {self.metagraph.block.item()} | '
+                        f'Number of nodes: {self.metagraph.n} | '
+                        f'Current epoch: {self.metagraph.block.item() // self.epoch_length}'
+                    )
                     bt.logging.info(log)
-
-                    # Also log current best score
-                    if self.best_score > 0:
-                        bt.logging.info(f'Current best score: {self.best_score}, Product: {self.candidate_product}')
-                    
                 self.current_block += 1
 
             except RuntimeError as e:
                 bt.logging.error(e)
                 traceback.print_exc()
-                # Don't crash on runtime errors, just continue
-                await asyncio.sleep(1)
 
             except KeyboardInterrupt:
                 bt.logging.success("Keyboard interrupt detected. Exiting miner.")
-                # Properly shutdown inference tasks
-                self.shutdown_event.set()
-                for task in self.inference_tasks:
-                    if not task.done():
-                        try:
-                            await asyncio.wait_for(task, timeout=2.0)
-                        except asyncio.TimeoutError:
-                            pass
                 exit()
 
 # Run the miner.
