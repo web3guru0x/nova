@@ -39,6 +39,11 @@ try:
 except:
     bt.logging.warning("Could not set CUDA device clocks - continuing without optimization")
 
+import logging
+
+# Dezactivează complet logging-ul pentru aceste module
+logging.getLogger('fsspec').disabled = True
+
 class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
@@ -291,6 +296,9 @@ class Miner:
             # Start timer
             start_time = time.time()
             
+            # Initialize chunk_psichic_scores to None
+            chunk_psichic_scores = None
+            
             # Process batch with PSICHIC wrapper
             with gpu_timer(f"Processing batch of {len(df)} molecules"):
                 if hasattr(torch, 'profiler'):
@@ -327,14 +335,15 @@ class Miner:
             self.processed_molecules += len(df)
             self.processing_time += elapsed_time
             
-            # Process results
-            chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-            if not chunk_psichic_scores.empty and self.psichic_result_column_name in chunk_psichic_scores.columns:
-                if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                    candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                    self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                    self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                    bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+            # Process results ONLY if chunk_psichic_scores is not None
+            if chunk_psichic_scores is not None:
+                chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                if not chunk_psichic_scores.empty and self.psichic_result_column_name in chunk_psichic_scores.columns:
+                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                        candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                        self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                        self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                        bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
             
             return chunk_psichic_scores
             
