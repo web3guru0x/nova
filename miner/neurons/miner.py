@@ -223,8 +223,8 @@ class Miner:
                             self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
                             self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
                             bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                        await asyncio.sleep(0.5)
-                    await asyncio.sleep(1.5)
+                    #     await asyncio.sleep(0.5)
+                    # await asyncio.sleep(1.5)
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
