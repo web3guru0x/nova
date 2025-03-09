@@ -123,32 +123,48 @@ class PsichicWrapper:
             raise
         
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
-        if not hasattr(self, 'protein_dict') or self.protein_dict is None:
-            raise ValueError("run_challenge_start must be called before run_validation to initialize protein_dict")
-        
-        torch.cuda.empty_cache()
-        print(f"CUDA Memory before smiles init: {torch.cuda.memory_allocated()/1e9:.2f} GB / {torch.cuda.max_memory_allocated()/1e9:.2f} GB max")
-        
         self.smiles_dict = self.initialize_smiles(smiles_list)
         
-        print(f"CUDA Memory after smiles init: {torch.cuda.memory_allocated()/1e9:.2f} GB / {torch.cuda.max_memory_allocated()/1e9:.2f} GB max")
+        # Clear CUDA cache before starting inference
+        if self.device != "cpu" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         
+        # Create a dataloader that properly uses CUDA
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         
-        print(f"Running validation on device: {self.device}")
-        print(f"CUDA Memory before screening: {torch.cuda.memory_allocated()/1e9:.2f} GB / {torch.cuda.max_memory_allocated()/1e9:.2f} GB max")
+        # Enable mixed precision with float16 for better GPU performance
+        use_amp = True if self.device != "cpu" and torch.cuda.is_available() else False
+        amp_dtype = torch.float16 if use_amp else None
         
-        self.screen_df = virtual_screening(self.screen_df, 
-                                        self.model, 
-                                        self.screen_loader,
-                                        os.getcwd(),
-                                        save_interpret=False,
-                                        ligand_dict=self.smiles_dict, 
-                                        device=self.device,
-                                        save_cluster=False,
-                                        )
-        
-        print(f"CUDA Memory after screening: {torch.cuda.memory_allocated()/1e9:.2f} GB / {torch.cuda.max_memory_allocated()/1e9:.2f} GB max")
+        # Use CUDA streams and profiling for GPU optimization
+        if self.device != "cpu" and torch.cuda.is_available():
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                    self.screen_df = virtual_screening(
+                        self.screen_df, 
+                        self.model, 
+                        self.screen_loader,
+                        os.getcwd(),
+                        save_interpret=False,
+                        ligand_dict=self.smiles_dict, 
+                        device=self.device,
+                        save_cluster=False,
+                    )
+                # Ensure GPU operations are complete
+                torch.cuda.synchronize()
+        else:
+            self.screen_df = virtual_screening(
+                self.screen_df, 
+                self.model, 
+                self.screen_loader,
+                os.getcwd(),
+                save_interpret=False,
+                ligand_dict=self.smiles_dict, 
+                device=self.device,
+                save_cluster=False,
+            )
         
         return self.screen_df
         

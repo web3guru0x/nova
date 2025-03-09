@@ -153,6 +153,26 @@ class Miner:
                 )
         return result
 
+    def monitor_gpu_usage():
+        """Function to monitor GPU usage during inference"""
+        if torch.cuda.is_available():
+            # Get current GPU memory usage
+            allocated = torch.cuda.memory_allocated(0)
+            reserved = torch.cuda.memory_reserved(0)
+            
+            # Print utilization stats
+            print(f"GPU Memory: {allocated/1e9:.2f} GB allocated, {reserved/1e9:.2f} GB reserved")
+            
+            # Get device properties
+            device_props = torch.cuda.get_device_properties(0)
+            utilization_pct = allocated / device_props.total_memory * 100
+            
+            print(f"GPU Utilization: {utilization_pct:.2f}% of {device_props.total_memory/1e9:.2f} GB total")
+            
+            # Check if we're using enough GPU memory
+            if utilization_pct < 10:
+                print("WARNING: GPU severely underutilized, operations may be running on CPU")
+
 
     def stream_random_chunk_from_dataset(self):
         # Streams a random chunk from the dataset repo on huggingface.
@@ -199,46 +219,91 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     async def run_psichic_model_loop(self):
-        """
-        Continuously runs the PSICHIC model on batches of molecules from the dataset.
-
-        This method streams random chunks of molecule data from a Hugging Face dataset,
-        processes them through the PSICHIC model to predict binding affinities, and updates
-        the best candidate when a higher scoring molecule is found. Runs in a separate thread
-        until the shutdown event is triggered.
-
-        The method:
-        1. Streams data in chunks from the dataset
-        2. Cleans the product names and SMILES strings
-        3. Runs PSICHIC predictions on each chunk
-        4. Updates the best candidate if a higher score is found
-        5. Continues until shutdown_event is set
-
-        Raises:
-            Exception: Logs any errors during execution and sets the shutdown event
-        """
         dataset = self.stream_random_chunk_from_dataset()
+
+        # Call monitor at start to check initial state
+        self.monitor_gpu_usage()
+        
+        # Ensure CUDA is properly configured
+        if torch.cuda.is_available():
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            # Log GPU details to verify usage
+            bt.logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            bt.logging.info(f"Memory allocated: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+            
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
+                    if torch.cuda.is_available():
+                        # Check GPU utilization periodically
+                        if random.random() < 0.05:  # 5% of batches
+                            bt.logging.debug(f"GPU Memory in use: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+                    
+                    # Start timing for data preprocessing
+                    preprocess_start = time.time()
+                    
+                    # Convert the chunk to a DataFrame
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    # Run the PSICHIC model on the chunk.
-                    bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                        async with self.shared_lock:
-                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                        await asyncio.sleep(1)
-                    await asyncio.sleep(3)
+                    
+                    preprocess_end = time.time()
+                    preprocess_time = preprocess_end - preprocess_start
+                    bt.logging.debug(f"Data preprocessing took {preprocess_time:.3f} seconds for {len(df)} molecules")
+                    
+                    # Run inference with CUDA profiling enabled
+                    try:
+                        # Start timing for model inference
+                        inference_start = time.time()
+                        
+                        bt.logging.debug(f'Running inference on batch of {len(df)} molecules...')
+                        
+                        # CRITICAL: Use CUDA profiling to ensure GPU is utilized
+                        if torch.cuda.is_available():
+                            with torch.cuda.profiler.profile():
+                                with torch.cuda.stream(torch.cuda.Stream()):
+                                    with torch.autograd.profiler.emit_nvtx():
+                                        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                                        # Force CUDA synchronization
+                                        torch.cuda.synchronize()
+                        else:
+                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                        
+                        inference_end = time.time()
+                        inference_time = inference_end - inference_start
+                        molecules_per_second = len(df) / inference_time
+                        
+                        bt.logging.info(f"GPU Inference completed in {inference_time:.3f} seconds, processing {molecules_per_second:.2f} molecules/second")
+                        
+                        # Further processing with results
+                        chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                        
+                        if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                            async with self.shared_lock:
+                                candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                                self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                                self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                                bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                    
+                    except Exception as e:
+                        bt.logging.error(f"Error in batch processing: {e}")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                    
+                    # Short sleep to prevent blocking the event loop
+                    await asyncio.sleep(0.01)  # Reduced sleep time for faster processing
+                    
+                    # Periodically cleanup to prevent memory issues
+                    if torch.cuda.is_available() and random.random() < 0.05:  # 5% chance
+                        torch.cuda.empty_cache()
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 self.shutdown_event.set()
 
     async def run(self):
@@ -259,6 +324,7 @@ class Miner:
             try:
                 self.psichic_wrapper.run_challenge_start(protein_sequence)
                 bt.logging.info(f"Initialized model for {start_protein}")
+                self.monitor_gpu_usage()
                 # Pornește inferența doar dacă inițializarea a reușit
                 try:
                     self.inference_task = asyncio.create_task(self.run_psichic_model_loop())
@@ -303,11 +369,13 @@ class Miner:
                     try:
                         self.psichic_wrapper.run_challenge_start(protein_sequence)
                         bt.logging.info('Model initialized successfully.')
+                        self.monitor_gpu_usage()
                     except Exception as e:
                         try:
                             os.system(f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt')} https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt")
                             self.psichic_wrapper.run_challenge_start(protein_sequence)
                             bt.logging.info('Model initialized successfully.')
+                            self.monitor_gpu_usage()
                         except Exception as e:
                             bt.logging.error(f'Error initializing model: {e}')
 
