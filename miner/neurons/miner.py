@@ -43,6 +43,7 @@ import logging
 
 # Dezactivează complet logging-ul pentru aceste module
 logging.getLogger('fsspec').disabled = True
+logging.getLogger('urllib3').disabled = True
 
 class Miner:
     def __init__(self):
