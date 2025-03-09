@@ -20,15 +20,15 @@
     "mol_in_channels": 43,
     "prot_in_channels": 33,
     "prot_evo_channels": 1280,
-    "hidden_channels": 768,
+    "hidden_channels": 1024,
     "aggregators": ["mean", "min", "max", "std", "sum"],
     "scalers": ["identity", "amplification", "linear", "attenuation"],
-    "pre_layers": 4,
-    "post_layers": 3,
-    "total_layer": 6,
-    "K": [15, 25, 35, 45, 55, 65],
-    "dropout": 0.25,
-    "dropout_attn_score": 0.35,
-    "heads": 12
+    "pre_layers": 5,
+    "post_layers": 4,
+    "total_layer": 8,
+    "K": [20, 40, 60, 80, 100, 120],
+    "dropout": 0.3,
+    "dropout_attn_score": 0.4,
+    "heads": 16
   }
 }
