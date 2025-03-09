@@ -192,6 +192,45 @@ def optimize_memory_for_inference(max_batch_size=None, num_warmup_iterations=2):
     
     logger.info("GPU memory optimized for inference")
 
+def track_gpu_memory_usage(label="Current"):
+    """Track and return detailed GPU memory usage with a label"""
+    allocated = torch.cuda.memory_allocated() / (1024 ** 3)  # GB
+    reserved = torch.cuda.memory_reserved() / (1024 ** 3)  # GB
+    max_allocated = torch.cuda.max_memory_allocated() / (1024 ** 3)  # GB
+    
+    # Get detailed stats if available
+    detailed_stats = {}
+    if hasattr(torch.cuda, 'memory_stats'):
+        stats = torch.cuda.memory_stats()
+        detailed_stats = {
+            'active_bytes': stats.get('active_bytes.all.current', 0) / (1024 ** 3),
+            'inactive_split_bytes': stats.get('inactive_split_bytes.all.current', 0) / (1024 ** 3),
+            'reserved_bytes': stats.get('reserved_bytes.all.current', 0) / (1024 ** 3),
+            'active_count': stats.get('active.all.current', 0),
+            'alloc_count': stats.get('allocation.all.current', 0)
+        }
+    
+    # Get utilization if available
+    utilization = torch.cuda.utilization()
+    
+    # Log the statistics
+    logger.info(f"GPU MEMORY [{label}]: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved, {max_allocated:.2f}GB max, {utilization}% utilization")
+    
+    if detailed_stats:
+        logger.info(f"GPU MEMORY DETAILS [{label}]: " + 
+                   f"Active: {detailed_stats['active_bytes']:.2f}GB ({detailed_stats['active_count']} blocks), " +
+                   f"Inactive: {detailed_stats['inactive_split_bytes']:.2f}GB, " +
+                   f"Allocations: {detailed_stats['alloc_count']}")
+    
+    # Return statistics dictionary
+    return {
+        'allocated_gb': allocated,
+        'reserved_gb': reserved,
+        'max_allocated_gb': max_allocated,
+        'utilization': utilization,
+        'detailed': detailed_stats if detailed_stats else None
+    }
+
 class CudaStreamPool:
     """Pool of CUDA streams for parallel execution"""
     

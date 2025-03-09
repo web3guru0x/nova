@@ -40,6 +40,16 @@ class PsichicWrapper:
         
         # Set optimal thread settings
         torch.set_num_threads(8)  # Limit CPU threads to avoid overhead
+        self.memory_tracking = True
+
+    def _log_time(self, stage, start_time=None):
+        """Helper to log timing information within the wrapper"""
+        current_time = time.time()
+        if start_time:
+            elapsed = current_time - start_time
+            print(f"WRAPPER TIMING: {stage} took {elapsed:.4f} seconds")
+            return current_time
+        return current_time
             
     def get_next_stream(self):
         """Get the next CUDA stream in round-robin fashion"""
@@ -146,26 +156,65 @@ class PsichicWrapper:
         return smiles_dict
     
     def create_screen_loader(self, protein_dict, smiles_dict):
-        self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-                                       'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-                                       })
+        """Create optimized data loader with detailed profiling"""
+        start_time = time.time()
+        print(f"DATALOADER: Creating screen loader with {len(self.smiles_list)} molecules")
         
-        # Create dataset with pinned memory
+        # Time DataFrame creation
+        df_start = time.time()
+        self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
+                                    'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+                                    })
+        df_end = time.time()
+        print(f"DATALOADER: DataFrame creation took {df_end - df_start:.4f} seconds")
+        
+        # Time dataset creation
+        dataset_start = time.time()
         dataset = ProteinMoleculeDataset(self.screen_df, 
-                                         smiles_dict, 
-                                         protein_dict, 
-                                         device=self.device
-                                         )
+                                        smiles_dict, 
+                                        protein_dict, 
+                                        device=self.device
+                                        )
+        dataset_end = time.time()
+        print(f"DATALOADER: Dataset creation took {dataset_end - dataset_start:.4f} seconds")
         
         # Use optimized data loader with pinned memory and multiple workers
+        loader_start = time.time()
+        
+        # Track memory before loader creation
+        if hasattr(torch.cuda, 'memory_allocated'):
+            mem_before = torch.cuda.memory_allocated() / (1024**3)  # GB
+        
         self.screen_loader = DataLoader(dataset,
-                               batch_size=self.runtime_config.BATCH_SIZE,
-                               shuffle=False,
-                               pin_memory=True,
-                               num_workers=8,  # Increase from 4 to 8
-                               persistent_workers=True,
-                               prefetch_factor=5,  # Increase from 3 to 5
-                               follow_batch=['mol_x', 'clique_x', 'prot_node_aa'])
+                                        batch_size=self.runtime_config.BATCH_SIZE,
+                                        shuffle=False,
+                                        pin_memory=True,
+                                        num_workers=8,  # Increased from 4 to 8
+                                        persistent_workers=True,
+                                        prefetch_factor=5,  # Increased prefetch factor
+                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
+                                    )
+        
+        # Track memory after loader creation
+        if hasattr(torch.cuda, 'memory_allocated'):
+            mem_after = torch.cuda.memory_allocated() / (1024**3)  # GB
+            print(f"DATALOADER: Memory usage change: {mem_after - mem_before:.2f}GB")
+        
+        # Try warming up the dataloader to prevent first-batch slowness
+        try:
+            warmup_start = time.time()
+            first_batch = next(iter(self.screen_loader))
+            del first_batch  # Make sure to free the memory
+            warmup_end = time.time()
+            print(f"DATALOADER: Dataloader warmup took {warmup_end - warmup_start:.4f} seconds")
+        except Exception as e:
+            print(f"DATALOADER: Warmup failed: {e}")
+        
+        loader_end = time.time()
+        print(f"DATALOADER: Loader creation took {loader_end - loader_start:.4f} seconds")
+        
+        total_time = time.time() - start_time
+        print(f"DATALOADER: Total setup took {total_time:.4f} seconds")
         
     def run_challenge_start(self, protein_seq:str):
         # Track timing
@@ -187,28 +236,48 @@ class PsichicWrapper:
         print(f"Model initialization completed in {elapsed_time:.2f} seconds")
         
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
+        """Run PSICHIC validation with detailed timing logs"""
         # Record start time
+        total_start = self._log_time("validation_start")
         self.start_event.record()
         
+        # Time SMILES initialization
+        smiles_start = self._log_time("smiles_init_start")
         # Initialize SMILES data
         self.smiles_dict = self.initialize_smiles(smiles_list)
+        smiles_end = self._log_time("smiles_initialization", smiles_start)
         
+        # Time cache clearing
+        cache_start = self._log_time("cache_clear_start")
         # Clear cache for inference
         torch.cuda.empty_cache()
+        cache_end = self._log_time("cache_clearing", cache_start)
         
+        # Time dataloader creation
+        loader_start = self._log_time("loader_creation_start")
         # Create data loader with optimized batching
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
+        loader_end = self._log_time("loader_creation", loader_start)
         
         # Process with parallel streams and mixed precision
         stream_results = []
         
+        # Time the actual model inference
+        inference_start = self._log_time("inference_start")
         for i, stream in enumerate(self.streams):
             with torch.cuda.stream(stream):
+                # Mark the start of stream processing
+                torch.cuda.nvtx.range_push(f"stream_{i}")
+                
                 # Use mixed precision for faster computation
                 with torch.cuda.amp.autocast(enabled=self.runtime_config.USE_MIXED_PRECISION, dtype=torch.float16):
                     # Process subset of loader
+                    subset_start = self._log_time(f"subset_{i}_start")
                     subset_loader = [batch for j, batch in enumerate(self.screen_loader) if j % len(self.streams) == i]
+                    
                     if subset_loader:
+                        # Time the virtual screening call
+                        screening_start = self._log_time(f"screening_{i}_start")
                         result_df = virtual_screening(
                             self.screen_df.copy(), 
                             self.model, 
@@ -219,13 +288,24 @@ class PsichicWrapper:
                             device=self.device,
                             save_cluster=False,
                         )
+                        screening_end = self._log_time(f"screening_{i}", screening_start)
                         stream_results.append(result_df)
+                    
+                    subset_end = self._log_time(f"subset_{i}", subset_start)
+                
+                # Mark the end of stream processing
+                torch.cuda.nvtx.range_pop()
         
         # Wait for all streams to complete
+        sync_start = self._log_time("sync_start")
         for stream in self.streams:
             torch.cuda.current_stream().wait_stream(stream)
         torch.cuda.synchronize()
+        sync_end = self._log_time("stream_synchronization", sync_start)
+        inference_end = self._log_time("inference", inference_start)
         
+        # Time results merging
+        merge_start = self._log_time("merge_start")
         # Merge results
         if stream_results:
             # Find first non-empty DataFrame
@@ -244,12 +324,22 @@ class PsichicWrapper:
                                 result_df.loc[match_idx, 'predicted_binding_affinity'] = row['predicted_binding_affinity']
         else:
             result_df = self.screen_df
-            
-        # Record end time
+        merge_end = self._log_time("results_merging", merge_start)
+        
+        # Record completion time
+        total_end = self._log_time("total_validation", total_start)
         self.end_event.record()
         torch.cuda.synchronize()
+        
+        # Calculate elapsed time and molecules/second
         elapsed_time = self.start_event.elapsed_time(self.end_event) / 1000  # Convert to seconds
         molecules_per_second = len(smiles_list) / elapsed_time if elapsed_time > 0 else 0
-        print(f"Processed {len(smiles_list)} molecules in {elapsed_time:.2f} seconds ({molecules_per_second:.2f} molecules/sec)")
+        
+        # Log detailed breakdown
+        print(f"WRAPPER TIMING SUMMARY: Processed {len(smiles_list)} molecules in {elapsed_time:.2f} seconds ({molecules_per_second:.2f} molecules/sec)")
+        print(f"WRAPPER TIMING BREAKDOWN: SMILES: {smiles_end-smiles_start:.4f}s, " + 
+            f"Loader: {loader_end-loader_start:.4f}s, " +
+            f"Inference: {inference_end-inference_start:.4f}s, " +
+            f"Merge: {merge_end-merge_start:.4f}s")
         
         return result_df

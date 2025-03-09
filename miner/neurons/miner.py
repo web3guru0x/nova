@@ -39,6 +39,23 @@ try:
 except:
     bt.logging.warning("Could not set CUDA device clocks - continuing without optimization")
 
+
+def profile_stage(name, start_time=None):
+    """Helper function to measure and log time for a processing stage"""
+    current_time = time.time()
+    if start_time:
+        elapsed = current_time - start_time
+        bt.logging.info(f"PROFILING: {name} took {elapsed:.4f} seconds")
+        
+        # Also log GPU memory usage at this point
+        mem_info = get_gpu_memory_usage()
+        if 'cuda:0' in mem_info:
+            bt.logging.info(f"PROFILING: GPU memory at {name}: {mem_info['cuda:0']['allocated_GB']:.2f}GB allocated, {mem_info['cuda:0']['utilization_percent']}% utilization")
+        
+        return current_time
+    return current_time
+
+
 class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
@@ -286,58 +303,70 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     def process_molecule_batch(self, df):
-        """Process a batch of molecules with the PSICHIC model"""
+        """Process a batch of molecules with the PSICHIC model with detailed profiling"""
         try:
-            # Start timer
-            start_time = time.time()
+            # Start overall timer
+            overall_start = profile_stage("START")
+            
+            # Preprocess data
+            preprocess_start = profile_stage("Preprocessing start")
+            
+            # Convert smiles to list before sending to validation
+            smiles_list = df['product_smiles'].tolist()
+            preprocess_end = profile_stage("Preprocessing", preprocess_start)
             
             # Process batch with PSICHIC wrapper
             with gpu_timer(f"Processing batch of {len(df)} molecules"):
-                if hasattr(torch, 'profiler'):
-                    with torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-                        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
-                        record_shapes=True,
-                        with_stack=True
-                    ) as prof:
-                        with torch.cuda.amp.autocast():
-                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                        prof.step()
-                else:
-                    # Fallback if profiler not available
-                    with torch.cuda.amp.autocast():
-                        chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-            
-            # Record processing time
-            elapsed_time = time.time() - start_time
-            molecules_per_second = len(df) / elapsed_time
-            self.molecule_processing_times.append(molecules_per_second)
-            
-            # Keep only the last 10 batches for average calculation
-            if len(self.molecule_processing_times) > 10:
-                self.molecule_processing_times.pop(0)
+                # Measure GPU transfer time
+                transfer_start = profile_stage("GPU transfer start")
                 
-            # Log throughput every few batches
-            if len(self.molecule_processing_times) >= 3:
-                avg_throughput = np.mean(self.molecule_processing_times)
-                bt.logging.info(f"Average throughput: {avg_throughput:.2f} molecules/second")
+                # GPU computation
+                compute_start = profile_stage("GPU computation start")
+                with torch.cuda.amp.autocast():
+                    # Add GPU event markers for detailed timing
+                    torch.cuda.nvtx.range_push("psichic_validation")
+                    chunk_psichic_scores = self.psichic_wrapper.run_validation(smiles_list)
+                    torch.cuda.nvtx.range_pop()
+                compute_end = profile_stage("GPU computation", compute_start)
             
-            # Update processed molecules counter
-            self.processed_molecules += len(df)
-            self.processing_time += elapsed_time
-            
+            # Post-processing
+            postprocess_start = profile_stage("Post-processing start")
             # Process results
-            chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
             if not chunk_psichic_scores.empty and self.psichic_result_column_name in chunk_psichic_scores.columns:
+                # Sort results
+                chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                
+                # Update best score
                 if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                     candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                    self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                    best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                    # Find product name
+                    torch.cuda.nvtx.range_push("product_name_lookup")
+                    self.best_score = best_score
                     self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                    torch.cuda.nvtx.range_pop()
                     bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
             
-            return chunk_psichic_scores
+            # Record overall processing statistics
+            postprocess_end = profile_stage("Post-processing", postprocess_start)
+            overall_end = profile_stage("OVERALL", overall_start)
             
+            # Calculate molecules per second
+            molecules_per_second = len(df) / (overall_end - overall_start)
+            self.molecule_processing_times.append(molecules_per_second)
+            
+            # Update counters
+            self.processed_molecules += len(df)
+            self.processing_time += (overall_end - overall_start)
+            
+            # Log performance breakdown
+            bt.logging.info(f"PROFILING SUMMARY: {len(df)} molecules at {molecules_per_second:.2f}/sec")
+            bt.logging.info(f"PROFILING BREAKDOWN: Preprocess: {preprocess_end-preprocess_start:.4f}s, " +
+                        f"Compute: {compute_end-compute_start:.4f}s, " +
+                        f"Postprocess: {postprocess_end-postprocess_start:.4f}s")
+            
+            return chunk_psichic_scores
+                
         except Exception as e:
             bt.logging.error(f"Error processing batch: {e}")
             bt.logging.error(traceback.format_exc())
