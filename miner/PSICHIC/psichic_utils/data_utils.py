@@ -351,6 +351,22 @@ def store_result(df, attention_dict, interaction_keys, ligand_dict,
     return df
 
 def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=True, ligand_dict=None, device=device, save_cluster=False):
+    """
+    Funcție care rulează inferența pentru screening virtual, optimizată pentru utilizare GPU.
+    
+    Args:
+        screen_df: DataFrame cu datele de screening
+        model: Modelul PSICHIC
+        data_loader: DataLoader pentru datele de inferență
+        result_path: Calea pentru salvarea rezultatelor
+        save_interpret: Dacă se salvează informații de interpretare
+        ligand_dict: Dicționar cu informații despre liganzi
+        device: Dispozitivul pe care rulează inferența ('cpu' sau 'cuda:X')
+        save_cluster: Dacă se salvează informații despre clustering
+        
+    Returns:
+        DataFrame cu rezultatele inferenței
+    """
     if "ID" in screen_df.columns:
         # Iterate through the DataFrame check any empty pairs 
         for i, row in screen_df.iterrows():
@@ -359,70 +375,127 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
     else:
         screen_df['ID'] = 'PAIR_' 
         screen_df['ID'] += screen_df.index.astype(str)
+    
     reg_preds = []
     cls_preds = []
     mcls_preds = []
 
+    # Setează modelul în mod de evaluare
     model.eval()
     
     # Afișează informații despre utilizarea memoriei CUDA înainte de inferență
     if device.startswith("cuda"):
         print(f"CUDA memory before inference: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}GB")
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
+        # Setează flaguri de optimizare pentru inferență
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     
-    with torch.no_grad():
+    # Preferăm torch.inference_mode() în locul torch.no_grad() pentru inferență mai rapidă
+    with torch.inference_mode():
         for data in tqdm(data_loader):
-            # Mută explicit data pe GPU și menține-o acolo
+            # Mută datele pe dispozitivul țintă, utilizând transferuri asincrone
             data = data.to(device, non_blocking=True)
             
-            # Profiling pentru a vedea ce operații sunt mutate pe CPU
-            with torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
-                record_shapes=True,
-                profile_memory=True,
-                with_stack=True
-            ) as prof:
-                # Wrapper într-un CUDA stream dedicat
-                with torch.cuda.stream(torch.cuda.Stream()):
-                    # Folosește autocast pentru operații mixte de precizie
-                    with torch.amp.autocast(device_type='cuda', enabled=device.startswith('cuda')):
+            # Pentru GPU, folosim CUDA streams și autocast pentru performanță optimă
+            if device.startswith("cuda"):
+                stream = torch.cuda.Stream()
+                with torch.cuda.stream(stream):
+                    # Folosește format mixt de precizie pentru calculele pe GPU
+                    with torch.amp.autocast(device_type='cuda', enabled=True):
                         reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
                                 # Molecule
-                                mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
-                                atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
-                                clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
+                                mol_x=data.mol_x, 
+                                mol_x_feat=data.mol_x_feat, 
+                                bond_x=data.mol_edge_attr,
+                                atom_edge_index=data.mol_edge_index, 
+                                clique_x=data.clique_x, 
+                                clique_edge_index=data.clique_edge_index, 
+                                atom2clique_index=data.atom2clique_index,
                                 # Protein
-                                residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
+                                residue_x=data.prot_node_aa, 
+                                residue_evo_x=data.prot_node_evo,
                                 residue_edge_index=data.prot_edge_index,
                                 residue_edge_weight=data.prot_edge_weight,
                                 # Mol-Protein Interaction batch
-                                mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, 
+                                mol_batch=data.mol_x_batch, 
+                                prot_batch=data.prot_node_aa_batch, 
                                 clique_batch=data.clique_x_batch,
                                 # save_cluster
                                 save_cluster=save_cluster
                         )
-                        
-                        # Procesarea rezultatelor - fă-o pe GPU cât mai mult posibil
-                        interaction_keys = list(zip(data.prot_key, data.mol_key))
-                        
-                        # Asigură-te că toate operațiile sunt sincronizate înainte de a trece datele pe CPU
-                        if device.startswith('cuda'):
-                            torch.cuda.synchronize()
-                        
-                        # Acum mută datele pe CPU doar dacă e necesar
-                        if reg_pred is not None:
-                            reg_pred = reg_pred.squeeze().reshape(-1).cpu().numpy()
-                        if cls_pred is not None:
-                            cls_pred = torch.sigmoid(cls_pred).squeeze().reshape(-1).cpu().numpy()
-                        if mcls_pred is not None:
-                            mcls_pred = torch.softmax(mcls_pred, dim=-1).cpu().numpy()
-                        
-                        # Store rezultatele după ce toate calculele GPU s-au terminat
-                        screen_df = store_result(screen_df, attention_dict, interaction_keys, ligand_dict, 
-                                               reg_pred, cls_pred, mcls_pred, 
-                                               result_path=result_path, save_interpret=save_interpret)
+                    
+                    # Forțează sincronizarea pentru a finaliza operațiile GPU
+                    torch.cuda.synchronize()
+            else:
+                # Inferența pe CPU (fără optimizări CUDA)
+                reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
+                        # Molecule
+                        mol_x=data.mol_x, 
+                        mol_x_feat=data.mol_x_feat, 
+                        bond_x=data.mol_edge_attr,
+                        atom_edge_index=data.mol_edge_index, 
+                        clique_x=data.clique_x, 
+                        clique_edge_index=data.clique_edge_index, 
+                        atom2clique_index=data.atom2clique_index,
+                        # Protein
+                        residue_x=data.prot_node_aa, 
+                        residue_evo_x=data.prot_node_evo,
+                        residue_edge_index=data.prot_edge_index,
+                        residue_edge_weight=data.prot_edge_weight,
+                        # Mol-Protein Interaction batch
+                        mol_batch=data.mol_x_batch, 
+                        prot_batch=data.prot_node_aa_batch, 
+                        clique_batch=data.clique_x_batch,
+                        # save_cluster
+                        save_cluster=save_cluster
+                )
             
-            # Verifică unde se petrec operațiile
-            if device.startswith('cuda') and random.random() < 0.01:  # 1% șansă
-                print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+            # Extrage cheile de interacțiune
+            interaction_keys = list(zip(data.prot_key, data.mol_key))
+
+            # Procesează rezultatele (doar acum mutăm datele pe CPU)
+            if reg_pred is not None:
+                # Realizează transferul pe CPU doar pentru procesarea finală
+                reg_pred_cpu = reg_pred.cpu().squeeze().reshape(-1).numpy()
+                reg_preds.append(reg_pred_cpu)
+                
+            if cls_pred is not None:
+                # Aplică sigmoid pe GPU, apoi transferă pe CPU
+                cls_pred_cpu = torch.sigmoid(cls_pred).cpu().squeeze().reshape(-1).numpy()
+                cls_preds.append(cls_pred_cpu)
+
+            if mcls_pred is not None:
+                # Aplică softmax pe GPU, apoi transferă pe CPU
+                mcls_pred_cpu = torch.softmax(mcls_pred, dim=-1).cpu().numpy()
+                mcls_preds.append(mcls_pred_cpu)
+
+            # Optimizare pentru attention_dict - mută pe CPU doar când e necesar
+            cpu_attention_dict = {}
+            for key, value in attention_dict.items():
+                if isinstance(value, torch.Tensor):
+                    # Mută pe CPU doar la final, după toate calculele
+                    cpu_attention_dict[key] = value
+                else:
+                    cpu_attention_dict[key] = value
+
+            # Stochează rezultatele
+            screen_df = store_result(screen_df, cpu_attention_dict, interaction_keys, ligand_dict, 
+                                     reg_pred_cpu if reg_pred is not None else None, 
+                                     cls_pred_cpu if cls_pred is not None else None, 
+                                     mcls_pred_cpu if mcls_pred is not None else None, 
+                                     result_path=result_path, save_interpret=save_interpret)
+            
+            # Management de memorie inteligent - eliberăm memoria GPU doar dacă utilizarea e ridicată
+            if device.startswith("cuda"):
+                current_usage = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory
+                if current_usage > 0.8:  # Eliberăm memoria doar dacă utilizăm peste 80%
+                    torch.cuda.empty_cache()
+                    print(f"GPU memory cleared. Current utilization: {torch.cuda.memory_allocated()/1e9:.2f}GB")
+    
+    # Afișează informații despre utilizarea memoriei CUDA după inferență
+    if device.startswith("cuda"):
+        print(f"CUDA memory after inference: {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}GB")
 
     return screen_df

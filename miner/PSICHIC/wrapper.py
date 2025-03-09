@@ -101,7 +101,10 @@ class PsichicWrapper:
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
                                         shuffle=False,
-                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
+                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
+                                        pin_memory=True,  # Adaugă pin_memory
+                                        num_workers=2,    # Adaugă workers pentru încărcare paralelă
+                                        prefetch_factor=2 # Prefetch factor pentru suprapunere
                                         )
         
     def run_challenge_start(self, protein_seq:str):
@@ -123,25 +126,29 @@ class PsichicWrapper:
             raise
         
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
-        self.smiles_dict = self.initialize_smiles(smiles_list)
-        
-        # Clear CUDA cache before starting inference
+        # Golește cache-ul înainte de a începe inferența
         if self.device != "cpu" and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         
-        # Create a dataloader that properly uses CUDA
+        # Creează un dicționar de SMILES pe GPU
+        self.smiles_dict = self.initialize_smiles(smiles_list)
+        
+        # Creează un dataloader optimizat pentru GPU
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         
-        # Enable mixed precision with float16 for better GPU performance
+        # Configurează procesarea cu precizie mixtă pentru performanță
         use_amp = True if self.device != "cpu" and torch.cuda.is_available() else False
-        amp_dtype = torch.float16 if use_amp else None
         
-        # Use CUDA streams and profiling for GPU optimization
+        # Rulează printr-un CUDA stream dedicat
         if self.device != "cpu" and torch.cuda.is_available():
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
-                with torch.amp.autocast(device_type='cuda', dtype=amp_dtype, enabled=use_amp):
+                with torch.amp.autocast(device_type='cuda', enabled=use_amp):
+                    # Adaugă prefetch pentru a suprapune procesarea CPU/GPU
+                    self.screen_loader.prefetch_factor = 2 if hasattr(self.screen_loader, 'prefetch_factor') else None
+                    
+                    # Procesează datele
                     self.screen_df = virtual_screening(
                         self.screen_df, 
                         self.model, 
@@ -152,7 +159,8 @@ class PsichicWrapper:
                         device=self.device,
                         save_cluster=False,
                     )
-                # Ensure GPU operations are complete
+                    
+                # Asigură-te că operațiunile GPU sunt complete
                 torch.cuda.synchronize()
         else:
             self.screen_df = virtual_screening(

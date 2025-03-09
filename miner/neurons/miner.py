@@ -37,7 +37,7 @@ class Miner:
         
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 64000
+        self.chunk_size = 128000
         self.tolerance = 3
 
         self.config = self.get_config()
@@ -222,85 +222,50 @@ class Miner:
     async def run_psichic_model_loop(self):
         dataset = self.stream_random_chunk_from_dataset()
         
-        # Ensure CUDA is properly configured
+        # Configurează CUDA pentru performanță
         if torch.cuda.is_available():
             torch.backends.cudnn.benchmark = True
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-            # Log GPU details to verify usage
-            bt.logging.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
-            bt.logging.info(f"Memory allocated: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
+            # Prioritizează operațiunile CUDA față de CPU
+            os.environ['CUDA_LAUNCH_BLOCKING'] = '0'
+            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
             
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    if torch.cuda.is_available():
-                        # Check GPU utilization periodically
-                        if random.random() < 0.05:  # 5% of batches
-                            self.monitor_gpu_usage()
+                    # Monitorizează memoria GPU periodic
+                    if torch.cuda.is_available() and random.random() < 0.05:
+                        self.monitor_gpu_usage()
                     
-                    # Start timing for data preprocessing
+                    # Preprocesează datele în mod eficient
                     preprocess_start = time.time()
-                    
-                    # Convert the chunk to a DataFrame
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    
                     preprocess_end = time.time()
-                    preprocess_time = preprocess_end - preprocess_start
-                    bt.logging.debug(f"Data preprocessing took {preprocess_time:.3f} seconds for {len(df)} molecules")
+                    bt.logging.debug(f"Data preprocessing took {preprocess_end - preprocess_start:.3f} seconds for {len(df)} molecules")
                     
-                    # Run inference with CUDA profiling enabled
                     try:
-                        # Start timing for model inference
+                        # Inferență GPU-optimizată
                         inference_start = time.time()
-                        
                         bt.logging.debug(f'Running inference on batch of {len(df)} molecules...')
                         
-                        # CRITICAL: Use CUDA profiling to ensure GPU is utilized
                         if torch.cuda.is_available():
-                            # Create a dedicated CUDA stream
-                            stream = torch.cuda.Stream()
-                            with torch.cuda.stream(stream):
-                                # Use autocast for mixed precision operations
-                                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                                    # Add profiling to identify bottlenecks
-                                    with torch.profiler.profile(
-                                        activities=[
-                                            torch.profiler.ProfilerActivity.CPU,
-                                            torch.profiler.ProfilerActivity.CUDA
-                                        ],
-                                        schedule=torch.profiler.schedule(
-                                            wait=10, warmup=10, active=20, repeat=1
-                                        ),
-                                        record_shapes=True,
-                                        with_stack=True,
-                                        profile_memory=True,
-                                    ) as prof:
-                                        chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                                    
-                                    # Force CUDA synchronization to ensure all operations complete
-                                    torch.cuda.synchronize()
-                                
-                            # Optionally, print profiling results to identify bottlenecks
-                            if random.random() < 0.01:  # 1% chance
-                                bt.logging.info("GPU Profiling Results:")
-                                bt.logging.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+                            with torch.cuda.amp.autocast(enabled=True):
+                                chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                         else:
                             chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                         
-                        inference_end = time.time()
-                        inference_time = inference_end - inference_start
-                        molecules_per_second = len(df) / inference_time
+                        inference_time = time.time() - inference_start
+                        bt.logging.info(f"Inference completed in {inference_time:.3f}s ({len(df)/inference_time:.1f} molecules/s)")
                         
-                        bt.logging.info(f"Inference completed in {inference_time:.3f} seconds, processing {molecules_per_second:.2f} molecules/second")
-                        
-                        # Process results
+                        # Procesează rezultatele
                         chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
                         
                         if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                             async with self.shared_lock:
+                                # Salvează candidatul
                                 candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
                                 self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
                                 self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
@@ -311,11 +276,11 @@ class Miner:
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     
-                    # Short sleep to prevent blocking the event loop
-                    await asyncio.sleep(0.01)  # Very short sleep time to maximize throughput
+                    # Evită blocarea event loop-ului
+                    await asyncio.sleep(0.01)
                     
-                    # Periodically cleanup to prevent memory issues
-                    if torch.cuda.is_available() and random.random() < 0.05:  # 5% chance
+                    # Curăță memoria GPU periodic
+                    if torch.cuda.is_available() and random.random() < 0.1:
                         torch.cuda.empty_cache()
 
             except Exception as e:
