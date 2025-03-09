@@ -109,30 +109,21 @@ class PNAConv(MessagePassing):
         if self.edge_dim is not None:
             self.edge_encoder = Linear(edge_dim, self.F_in)
 
-        # Optimize for GPU by pre-allocating ModuleLists
         self.pre_nns = ModuleList()
         self.post_nns = ModuleList()
-        
-        # Create activation function once and reuse
-        activation = activation_resolver(act, **(act_kwargs or {}))
-        
         for _ in range(towers):
-            # Pre-neural networks
-            pre_nn_modules = []
-            pre_nn_modules.append(Linear((3 if edge_dim else 2) * self.F_in, self.F_in))
+            modules = [Linear((3 if edge_dim else 2) * self.F_in, self.F_in)]
             for _ in range(pre_layers - 1):
-                pre_nn_modules.append(activation)
-                pre_nn_modules.append(Linear(self.F_in, self.F_in))
-            self.pre_nns.append(Sequential(*pre_nn_modules))
+                modules += [activation_resolver(act, **(act_kwargs or {}))]
+                modules += [Linear(self.F_in, self.F_in)]
+            self.pre_nns.append(Sequential(*modules))
 
-            # Post-neural networks
             in_channels = (len(aggregators) * len(scalers) + 1) * self.F_in
-            post_nn_modules = []
-            post_nn_modules.append(Linear(in_channels, self.F_out))
+            modules = [Linear(in_channels, self.F_out)]
             for _ in range(post_layers - 1):
-                post_nn_modules.append(activation)
-                post_nn_modules.append(Linear(self.F_out, self.F_out))
-            self.post_nns.append(Sequential(*post_nn_modules))
+                modules += [activation_resolver(act, **(act_kwargs or {}))]
+                modules += [Linear(self.F_out, self.F_out)]
+            self.post_nns.append(Sequential(*modules))
 
         self.lin = Linear(out_channels, out_channels)
 
@@ -150,47 +141,34 @@ class PNAConv(MessagePassing):
     def forward(self, x: Tensor, edge_index: Adj,
                 edge_attr: OptTensor = None) -> Tensor:
         """"""
-        # Use CUDA stream for parallel processing
-        with torch.cuda.stream(torch.cuda.Stream()):
-            if self.divide_input:
-                x = x.view(-1, self.towers, self.F_in)
-            else:
-                x = x.view(-1, 1, self.F_in).repeat(1, self.towers, 1)
+        if self.divide_input:
+            x = x.view(-1, self.towers, self.F_in)
+        else:
+            x = x.view(-1, 1, self.F_in).repeat(1, self.towers, 1)
 
-            # propagate_type: (x: Tensor, edge_attr: OptTensor)
-            out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=None)
+        # propagate_type: (x: Tensor, edge_attr: OptTensor)
+        out = self.propagate(edge_index, x=x, edge_attr=edge_attr, size=None)
 
-            out = torch.cat([x, out], dim=-1)
-            
-            # Process neural networks in parallel for each tower
-            tower_outs = []
-            for i, nn in enumerate(self.post_nns):
-                tower_outs.append(nn(out[:, i]))
-            
-            out = torch.cat(tower_outs, dim=1)
-            
-            # Final linear transformation
-            return self.lin(out)
+        out = torch.cat([x, out], dim=-1)
+        outs = [nn(out[:, i]) for i, nn in enumerate(self.post_nns)]
+        out = torch.cat(outs, dim=1)
+
+        return self.lin(out)
 
     def message(self, x_i: Tensor, x_j: Tensor,
                 edge_attr: OptTensor) -> Tensor:
-        # Process message function efficiently on GPU
-        with torch.cuda.amp.autocast():
-            h: Tensor = x_i  # Dummy.
-            if edge_attr is not None:
-                edge_attr = self.edge_encoder(edge_attr)
-                edge_attr = edge_attr.view(-1, 1, self.F_in)
-                edge_attr = edge_attr.repeat(1, self.towers, 1)
-                h = torch.cat([x_i, x_j, edge_attr], dim=-1)
-            else:
-                h = torch.cat([x_i, x_j], dim=-1)
 
-            # Process towers in parallel
-            hs = []
-            for i, nn in enumerate(self.pre_nns):
-                hs.append(nn(h[:, i]))
-            
-            return torch.stack(hs, dim=1)
+        h: Tensor = x_i  # Dummy.
+        if edge_attr is not None:
+            edge_attr = self.edge_encoder(edge_attr)
+            edge_attr = edge_attr.view(-1, 1, self.F_in)
+            edge_attr = edge_attr.repeat(1, self.towers, 1)
+            h = torch.cat([x_i, x_j, edge_attr], dim=-1)
+        else:
+            h = torch.cat([x_i, x_j], dim=-1)
+
+        hs = [nn(h[:, i]) for i, nn in enumerate(self.pre_nns)]
+        return torch.stack(hs, dim=1)
 
     def __repr__(self):
         return (f'{self.__class__.__name__}({self.in_channels}, '
@@ -204,13 +182,11 @@ class PNAConv(MessagePassing):
             d = degree(data.edge_index[1], num_nodes=data.num_nodes,
                        dtype=torch.long)
             max_degree = max(max_degree, int(d.max()))
-            
         # Compute the in-degree histogram tensor
-        deg_histogram = torch.zeros(max_degree + 1, dtype=torch.long, device='cuda:0')
-        
+        deg_histogram = torch.zeros(max_degree + 1, dtype=torch.long)
         for data in loader:
             d = degree(data.edge_index[1], num_nodes=data.num_nodes,
-                       dtype=torch.long).cuda()
+                       dtype=torch.long)
             deg_histogram += torch.bincount(d, minlength=deg_histogram.numel())
 
         return deg_histogram

@@ -12,14 +12,22 @@ class DegreeScalerAggregation(Aggregation):
     r"""Combines one or more aggregators and transforms its output with one or
     more scalers as introduced in the `"Principal Neighbourhood Aggregation for
     Graph Nets" <https://arxiv.org/abs/2004.05718>`_ paper.
-    Optimized for GPU processing.
+    The scalers are normalised by the in-degree of the training set and so must
+    be provided at time of construction.
+    See :class:`torch_geometric.nn.conv.PNAConv` for more information.
 
     Args:
         aggr (string or list or Aggregation): The aggregation scheme to use.
-        scaler (str or list): Set of scaling function identifiers.
-        deg (Tensor): Histogram of in-degrees of nodes in the training set.
+            See :class:`~torch_geometric.nn.conv.MessagePassing` for more
+            information.
+        scaler (str or list): Set of scaling function identifiers, namely one
+            or more of :obj:`"identity"`, :obj:`"amplification"`,
+            :obj:`"attenuation"`, :obj:`"linear"` and :obj:`"inverse_linear"`.
+        deg (Tensor): Histogram of in-degrees of nodes in the training set,
+            used by scalers to normalize.
         aggr_kwargs (Dict[str, Any], optional): Arguments passed to the
-            respective aggregation function. (default: :obj:`None`)
+            respective aggregation function in case it gets automatically
+            resolved. (default: :obj:`None`)
     """
     def __init__(
         self,
@@ -30,7 +38,6 @@ class DegreeScalerAggregation(Aggregation):
     ):
         super().__init__()
 
-        # Optimize aggregator initialization for GPU
         if isinstance(aggr, (str, Aggregation)):
             self.aggr = aggr_resolver(aggr, **(aggr_kwargs or {}))
         elif isinstance(aggr, (tuple, list)):
@@ -40,62 +47,48 @@ class DegreeScalerAggregation(Aggregation):
                              f"`torch_geometric.nn.aggr.Aggregation` are "
                              f"valid aggregation schemes (got '{type(aggr)}')")
 
-        self.scaler = [scaler] if isinstance(scaler, str) else scaler
+        self.scaler = [scaler] if isinstance(aggr, str) else scaler
 
-        # Pre-compute average degrees for GPU
         deg = deg.to(torch.float)
         num_nodes = int(deg.sum())
         bin_degrees = torch.arange(deg.numel(), device=deg.device)
-        self.avg_deg = {
+        self.avg_deg: Dict[str, float] = {
             'lin': float((bin_degrees * deg).sum()) / num_nodes,
             'log': float(((bin_degrees + 1).log() * deg).sum()) / num_nodes,
             'exp': float((bin_degrees.exp() * deg).sum()) / num_nodes,
         }
-        
-        # Cache parameters in registered buffers for GPU access
-        self.register_buffer('bin_degrees', bin_degrees)
-        self.register_buffer('deg_values', deg)
 
     def forward(self, x: Tensor, index: Optional[Tensor] = None,
                 ptr: Optional[Tensor] = None, dim_size: Optional[int] = None,
                 dim: int = -2) -> Tensor:
 
-        # Use CUDA streams for parallel processing
-        with torch.cuda.stream(torch.cuda.Stream()):
-            # Assert index is present for degree computation
-            self.assert_index_present(index)
+        # TODO Currently, `degree` can only operate on `index`:
+        self.assert_index_present(index)
 
-            # Use the aggregator
-            out = self.aggr(x, index, ptr, dim_size, dim)
+        out = self.aggr(x, index, ptr, dim_size, dim)
 
-            # Compute degrees with careful device management
-            assert index is not None
-            deg = degree(index, num_nodes=dim_size, dtype=out.dtype).clamp_(1)
-            size = [1] * len(out.size())
-            size[dim] = -1
-            deg = deg.view(size)
+        assert index is not None
+        deg = degree(index, num_nodes=dim_size, dtype=out.dtype).clamp_(1)
+        size = [1] * len(out.size())
+        size[dim] = -1
+        deg = deg.view(size)
 
-            # Process scalers in parallel when possible
-            outs = []
-            for scaler in self.scaler:
-                if scaler == 'identity':
-                    out_scaler = out
-                elif scaler == 'amplification':
-                    log_deg = torch.log(deg + 1)
-                    out_scaler = out * (log_deg / self.avg_deg['log'])
-                elif scaler == 'attenuation':
-                    log_deg = torch.log(deg + 1)
-                    out_scaler = out * (self.avg_deg['log'] / log_deg)
-                elif scaler == 'exponential':
-                    exp_deg = torch.exp(deg)
-                    out_scaler = out * (exp_deg / self.avg_deg['exp'])
-                elif scaler == 'linear':
-                    out_scaler = out * (deg / self.avg_deg['lin'])
-                elif scaler == 'inverse_linear':
-                    out_scaler = out * (self.avg_deg['lin'] / deg)
-                else:
-                    raise ValueError(f"Unknown scaler '{scaler}'")
-                outs.append(out_scaler)
+        outs = []
+        for scaler in self.scaler:
+            if scaler == 'identity':
+                out_scaler = out
+            elif scaler == 'amplification':
+                out_scaler = out * (torch.log(deg + 1) / self.avg_deg['log'])
+            elif scaler == 'attenuation':
+                out_scaler = out * (self.avg_deg['log'] / torch.log(deg + 1))
+            elif scaler == 'exponential':
+                out_scaler = out * (torch.exp(deg) / self.avg_deg['exp'])
+            elif scaler == 'linear':
+                out_scaler = out * (deg / self.avg_deg['lin'])
+            elif scaler == 'inverse_linear':
+                out_scaler = out * (self.avg_deg['lin'] / deg)
+            else:
+                raise ValueError(f"Unknown scaler '{scaler}'")
+            outs.append(out_scaler)
 
-        # Combine outputs efficiently
         return torch.cat(outs, dim=-1) if len(outs) > 1 else outs[0]

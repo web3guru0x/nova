@@ -1,8 +1,6 @@
 import numpy as np
 import pandas as pd
 import sys
-import os
-import torch
 
 # Check if the code is running in a Jupyter notebook
 if 'ipykernel' in sys.modules:
@@ -10,6 +8,7 @@ if 'ipykernel' in sys.modules:
 else:
     from tqdm import tqdm
 
+import torch
 import esm
 from torch_geometric.utils import degree, add_self_loops, subgraph, to_undirected, remove_self_loops, coalesce
 
@@ -20,8 +19,8 @@ def protein_init(seqs):
     model_location = "esm2_t33_650M_UR50D"
     model, alphabet = esm.pretrained.load_model_and_alphabet(model_location)
     model.eval()
-    # Force GPU usage
-    model = model.cuda()
+    if torch.cuda.is_available():
+        model = model.cuda()
     batch_converter = alphabet.get_batch_converter()
 
     for seq in tqdm(seqs):
@@ -33,15 +32,16 @@ def protein_init(seqs):
         
         result_dict[seq] = {
             'seq':seq,
-            'seq_feat':torch.from_numpy(seq_feat).cuda(),
-            'token_representation':token_repr.half().cuda(),
+            'seq_feat':torch.from_numpy(seq_feat),
+            'token_representation':token_repr.half(),
             'num_nodes': len(seq),
-            'num_pos':torch.arange(len(seq)).reshape(-1,1).cuda(),
-            'edge_index': edge_index.cuda(),
-            'edge_weight': edge_weight.cuda(),
+            'num_pos':torch.arange(len(seq)).reshape(-1,1),
+            'edge_index': edge_index,
+            'edge_weight':  edge_weight,
         }
 
     return result_dict
+
 
 
 # normalize
@@ -172,14 +172,13 @@ def contact_map(contact_map_proba, contact_threshold=0.5):
 
 
 
-def esm_extract(model, batch_converter, seq, layer=36, approach='mean', dim=2560):
+def esm_extract(model, batch_converter, seq, layer=36, approach='mean',dim=2560):
     pro_id = 'A'
     if len(seq) <= 700:
         data = []
         data.append((pro_id, seq))
         batch_labels, batch_strs, batch_tokens = batch_converter(data)
-        # Move tokens directly to GPU
-        batch_tokens = batch_tokens.cuda(non_blocking=True)
+        batch_tokens = batch_tokens.to(next(model.parameters()).device, non_blocking=True)
 
         with torch.no_grad():
             results = model(batch_tokens, repr_layers=[i for i in range(1, layer + 1)], return_contacts=True)
@@ -199,35 +198,49 @@ def esm_extract(model, batch_converter, seq, layer=36, approach='mean', dim=2560
         token_representation = token_representation.cpu().numpy()
         token_representation = token_representation[1: len(seq) + 1]
     else:
-        contact_prob_map = np.zeros((len(seq), len(seq)))
+        contact_prob_map = np.zeros((len(seq), len(seq)))  # global contact map prediction
         token_representation = np.zeros((len(seq), dim))
-        logits = np.zeros((len(seq), layer))
-        interval = 700  # Increased interval to process more residues at once
+        logits = np.zeros((len(seq),layer))
+        interval = 350
         i = math.ceil(len(seq) / interval)
-        
+        # ======================
+        # =                    =
+        # =                    =
+        # =          ======================
+        # =          =*********=          =
+        # =          =*********=          =
+        # ======================          =
+        #            =                    =
+        #            =                    =
+        #            ======================
+        # where * is the overlapping area
+        # subsection seq contact map prediction
         for s in range(i):
-            start = s * interval
-            end = min((s + 2) * interval, len(seq))
+            start = s * interval  # sub seq predict start
+            end = min((s + 2) * interval, len(seq))  # sub seq predict end
             sub_seq_len = end - start
 
+            # prediction
             temp_seq = seq[start:end]
             temp_data = []
             temp_data.append((pro_id, temp_seq))
             batch_labels, batch_strs, batch_tokens = batch_converter(temp_data)
-            # Move tokens directly to GPU with non_blocking=True for faster transfer
-            batch_tokens = batch_tokens.cuda(non_blocking=True)
+            batch_tokens = batch_tokens.to(next(model.parameters()).device, non_blocking=True)
             with torch.no_grad():
                 results = model(batch_tokens, repr_layers=[i for i in range(1, layer + 1)], return_contacts=True)
 
+            # insert into the global contact map
             row, col = np.where(contact_prob_map[start:end, start:end] != 0)
             row = row + start
             col = col + start
-            contact_prob_map[start:end, start:end] = contact_prob_map[start:end, start:end] + results["contacts"][0].cpu().numpy()
+            contact_prob_map[start:end, start:end] = contact_prob_map[start:end, start:end] + results["contacts"][
+                0].cpu().numpy()
             contact_prob_map[row, col] = contact_prob_map[row, col] / 2.0
             
             logits[start:end] += results['logits'][0].cpu().numpy()[1: len(temp_seq) + 1]
             logits[row] = logits[row]/2.0
 
+            ## TOKEN
             subtoken_repr = torch.cat([results['representations'][i] for i in range(1, layer + 1)])
             assert subtoken_repr.size(0) == layer
             if approach == 'last':

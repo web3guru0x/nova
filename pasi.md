@@ -7,6 +7,9 @@ source .venv/bin/activate
 
 wget -O PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt
 
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512  # Gestionare memorie
+export CUDA_LAUNCH_BLOCKING=1  # Debug CUDA
+
 export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:512"
 
 apt update && apt install -y tmux
