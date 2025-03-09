@@ -37,7 +37,7 @@ class MotifPool(torch.nn.Module):
         x_clique = x_clique + F.relu(self.lin_proj(hx_clique))
         ## GNN scoring
         score_clique = x_clique.view(-1, H, C)
-        score = torch.cat([ mlp(score_clique[:, i]) for i, mlp in enumerate(self.score_proj) ], dim=-1)
+        score = torch.stack([mlp(score_clique[:, i]) for i, mlp in enumerate(self.score_proj)], dim=1).squeeze(-1)
         score = F.dropout(score, p=self.dropout_attn_score, training=self.training)
         alpha = softmax(score, clique_batch)    
 
