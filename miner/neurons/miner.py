@@ -153,7 +153,7 @@ class Miner:
                 )
         return result
 
-    def monitor_gpu_usage():
+    def monitor_gpu_usage(self):
         """Function to monitor GPU usage during inference"""
         if torch.cuda.is_available():
             # Get current GPU memory usage
