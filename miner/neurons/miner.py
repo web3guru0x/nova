@@ -189,43 +189,43 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     async def run_psichic_model_loop(self):
-        """Continuously runs the PSICHIC model on batches of molecules from the dataset."""
         dataset = self.stream_random_chunk_from_dataset()
+        # Keep track of all processed molecules
+        all_processed_smiles = set()
+        
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
                     start_time = time.time()
                     
-                    # Create dataframe
-                    df_time_start = time.time()
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].str.replace('"', '')
                     df['product_smiles'] = df['product_smiles'].str.replace('"', '')
-                    df_time = time.time() - df_time_start
                     
-                    # Run inference
-                    inference_time_start = time.time()
-                    bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                    inference_time = time.time() - inference_time_start
+                    # Only process unique molecules we haven't seen before
+                    unique_smiles = set(df['product_smiles'])
+                    new_smiles = list(unique_smiles - all_processed_smiles)
                     
-                    # Process results
-                    processing_time_start = time.time()
-                    chunk_psichic_scores = chunk_psichic_scores.sort_values(
-                        by=self.psichic_result_column_name, 
-                        ascending=False
-                    ).reset_index(drop=True)
-                    
-                    if not chunk_psichic_scores.empty and chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                        async with self.shared_lock:
-                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                    processing_time = time.time() - processing_time_start
+                    if new_smiles:
+                        bt.logging.debug(f'Running inference on {len(new_smiles)} new molecules...')
+                        chunk_psichic_scores = self.psichic_wrapper.run_validation(new_smiles)
+                        all_processed_smiles.update(new_smiles)
+                        
+                        if not chunk_psichic_scores.empty:
+                            chunk_psichic_scores = chunk_psichic_scores.sort_values(
+                                by=self.psichic_result_column_name, 
+                                ascending=False
+                            ).reset_index(drop=True)
+                            
+                            if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                                async with self.shared_lock:
+                                    candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                                    self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                                    self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                                    bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
                     
                     total_time = time.time() - start_time
-                    bt.logging.info(f"Timing: Total={total_time:.2f}s | DataFrame={df_time:.2f}s | Inference={inference_time:.2f}s | Processing={processing_time:.2f}s")
+                    bt.logging.info(f"Processed chunk in {total_time:.2f}s")
                     
                     await asyncio.sleep(0.1)
                     

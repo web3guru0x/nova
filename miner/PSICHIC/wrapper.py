@@ -17,6 +17,7 @@ class PsichicWrapper:
     def __init__(self):
         self.runtime_config = RuntimeConfig()
         self.device = self.runtime_config.DEVICE
+        self.results_cache = {}
         
         with open(os.path.join(self.runtime_config.MODEL_PATH, 'config.json'), 'r') as f:
             self.model_config = json.load(f)
@@ -96,18 +97,40 @@ class PsichicWrapper:
         self.load_model()
         self.protein_dict = self.initialize_protein(protein_seq)
         
-    def run_validation(self, smiles_list:list) -> pd.DataFrame:
-        self.smiles_dict = self.initialize_smiles(smiles_list)
-        torch.cuda.empty_cache()
-        self.create_screen_loader(self.protein_dict, self.smiles_dict)
-        self.screen_df = virtual_screening(self.screen_df, 
-                                           self.model, 
-                                           self.screen_loader,
-                                           os.getcwd(),
-                                           save_interpret=False,
-                                           ligand_dict=self.smiles_dict, 
-                                           device=self.device,
-                                           save_cluster=False,
-                                           )
-        return self.screen_df
+    def run_validation(self, smiles_list):
+        # Filter out molecules we've already processed
+        uncached_smiles = [s for s in smiles_list if s not in self.result_cache]
+        
+        if uncached_smiles:
+            # Only run inference on new molecules
+            self.screen_df = pd.DataFrame({
+                'Protein': [k for k in self.protein_seq for _ in uncached_smiles],
+                'Ligand': [l for l in uncached_smiles for _ in self.protein_seq],
+            })
+            
+            smiles_dict = self.initialize_smiles(uncached_smiles)
+            self.create_screen_loader(self.protein_dict, smiles_dict)
+            
+            new_results = virtual_screening(
+                self.screen_df, 
+                self.model, 
+                self.screen_loader,
+                os.getcwd(),
+                save_interpret=False,
+                ligand_dict=smiles_dict, 
+                device=self.device,
+                save_cluster=False
+            )
+            
+            # Update cache with new results
+            for _, row in new_results.iterrows():
+                self.result_cache[row['Ligand']] = row
+        
+        # Build result DataFrame from cache
+        results = []
+        for smiles in smiles_list:
+            if smiles in self.result_cache:
+                results.append(self.result_cache[smiles])
+        
+        return pd.DataFrame(results) if results else pd.DataFrame()
         
