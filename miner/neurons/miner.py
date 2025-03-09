@@ -15,6 +15,7 @@ from datasets import load_dataset
 from huggingface_hub import list_repo_files
 import pandas as pd
 from tqdm import tqdm
+import numpy as np
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)

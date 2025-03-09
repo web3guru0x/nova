@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 import torch
+import numpy as np
 from tqdm import tqdm
 
 from .psichic_utils.dataset import ProteinMoleculeDataset
@@ -97,8 +98,12 @@ class PsichicWrapper:
         torch.cuda.empty_cache()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
         
-        # Create FP16 scaler for mixed precision
-        scaler = torch.cuda.amp.GradScaler()
+        # Import tqdm
+        from tqdm import tqdm
+        import numpy as np  # Add import here as well for redundancy
+        
+        # Create FP16 scaler for mixed precision - use new API
+        scaler = torch.amp.GradScaler(device_type='cuda')
         
         # Run with mixed precision
         with torch.no_grad():
@@ -113,8 +118,8 @@ class PsichicWrapper:
             for data in tqdm(self.screen_loader):
                 data = data.to(self.device)
                 
-                # Use mixed precision for faster computation
-                with torch.cuda.amp.autocast():
+                # Use mixed precision for faster computation - use new API
+                with torch.amp.autocast(device_type='cuda'):
                     reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = self.model(
                             # Molecule
                             mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
