@@ -19,34 +19,25 @@ def protein_init(seqs):
     model_location = "esm2_t33_650M_UR50D"
     model, alphabet = esm.pretrained.load_model_and_alphabet(model_location)
     model.eval()
-    
-    # Forțează modelul pe GPU dacă este disponibil
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    print(f"ESM model using device: {device}")
-    model = model.to(device)
-    
+    if torch.cuda.is_available():
+        model = model.cuda()
     batch_converter = alphabet.get_batch_converter()
 
     for seq in tqdm(seqs):
         seq_feat = seq_feature(seq)
-        token_repr, contact_map_proba, logits = esm_extract(model, batch_converter, seq, layer=33, approach='last', dim=1280)
+        token_repr, contact_map_proba, logits = esm_extract(model, batch_converter, seq, layer=33, approach='last',dim=1280)
         
-        # Verifică dacă contact_map_proba este valid înainte de a-l folosi
-        if contact_map_proba is None or contact_map_proba.shape[0] != len(seq):
-            print(f"Warning: Invalid contact map for sequence of length {len(seq)}")
-            # Creează un contact map gol cu dimensiunea corectă
-            contact_map_proba = torch.zeros((len(seq), len(seq)), device=device)
-        
+        assert len(contact_map_proba) == len(seq)
         edge_index, edge_weight = contact_map(contact_map_proba)
         
         result_dict[seq] = {
-            'seq': seq,
-            'seq_feat': torch.from_numpy(seq_feat).to(device),
-            'token_representation': token_repr.half().to(device),
+            'seq':seq,
+            'seq_feat':torch.from_numpy(seq_feat),
+            'token_representation':token_repr.half(),
             'num_nodes': len(seq),
-            'num_pos': torch.arange(len(seq)).reshape(-1,1).to(device),
-            'edge_index': edge_index.to(device),
-            'edge_weight': edge_weight.to(device),
+            'num_pos':torch.arange(len(seq)).reshape(-1,1),
+            'edge_index': edge_index,
+            'edge_weight':  edge_weight,
         }
 
     return result_dict
@@ -153,196 +144,124 @@ def seq_feature(pro_seq):
     return np.concatenate((pro_hot, pro_property), axis=1)
 
 def contact_map(contact_map_proba, contact_threshold=0.5):
-    try:
-        device = contact_map_proba.device
-        num_residues = contact_map_proba.shape[0]
-        
-        # Verifică dacă contact_map_proba este valid
-        if num_residues == 0:
-            # Returnează valori implicite pentru un graf gol
-            return torch.zeros((2, 0), device=device), torch.zeros(0, device=device)
-        
-        prot_contact_adj = (contact_map_proba >= contact_threshold).long()
-        edge_index = prot_contact_adj.nonzero(as_tuple=False).t().contiguous()
-        
-        # Verifică dacă edge_index este gol sau invalid
-        if edge_index.shape[0] == 0 or edge_index.shape[1] == 0:
-            # Creează edge_index implicit cu conexiuni adiacente
-            rows = torch.arange(num_residues-1, device=device)
-            cols = torch.arange(1, num_residues, device=device)
-            edge_index = torch.stack([rows, cols])
-            edge_weight = torch.ones(edge_index.shape[1], device=device) * contact_threshold
-            return edge_index, edge_weight
-        
-        row, col = edge_index
-        edge_weight = contact_map_proba[row, col].float()
-        
-        # Adaugă conexiuni pentru a evita noduri izolate
-        seq_edge_head1 = torch.stack([torch.arange(num_residues, device=device)[:-1], 
-                                     (torch.arange(num_residues, device=device)+1)[:-1]])
-        seq_edge_tail1 = torch.stack([(torch.arange(num_residues, device=device))[1:],
-                                     (torch.arange(num_residues, device=device)-1)[1:]])
-        seq_edge_weight1 = torch.ones(seq_edge_head1.size(1) + seq_edge_tail1.size(1), device=device) * contact_threshold
-        edge_index = torch.cat([edge_index, seq_edge_head1, seq_edge_tail1], dim=-1)
-        edge_weight = torch.cat([edge_weight, seq_edge_weight1], dim=-1)
+    num_residues = contact_map_proba.shape[0]
+    prot_contact_adj = (contact_map_proba >= contact_threshold).long()
+    edge_index = prot_contact_adj.nonzero(as_tuple=False).t().contiguous()
+    row, col = edge_index
+    edge_weight = contact_map_proba[row, col].float()
+    ############### CONNECT ISOLATED NODES - Prevent Disconnected Residues ######################
+    seq_edge_head1 = torch.stack([torch.arange(num_residues)[:-1],(torch.arange(num_residues)+1)[:-1]])
+    seq_edge_tail1 = torch.stack([(torch.arange(num_residues))[1:],(torch.arange(num_residues)-1)[1:]])
+    seq_edge_weight1 = torch.ones(seq_edge_head1.size(1) + seq_edge_tail1.size(1)) * contact_threshold
+    edge_index = torch.cat([edge_index, seq_edge_head1, seq_edge_tail1],dim=-1)
+    edge_weight = torch.cat([edge_weight, seq_edge_weight1],dim=-1)
 
-        seq_edge_head2 = torch.stack([torch.arange(num_residues)[:-2],(torch.arange(num_residues)+2)[:-2]])
-        seq_edge_tail2 = torch.stack([(torch.arange(num_residues))[2:],(torch.arange(num_residues)-2)[2:]])
-        seq_edge_weight2 = torch.ones(seq_edge_head2.size(1) + seq_edge_tail2.size(1)) *contact_threshold
-        edge_index = torch.cat([edge_index, seq_edge_head2, seq_edge_tail2],dim=-1)
-        edge_weight = torch.cat([edge_weight, seq_edge_weight2],dim=-1)
-        ############### CONNECT ISOLATED NODES - Prevent Disconnected Residues ######################
+    seq_edge_head2 = torch.stack([torch.arange(num_residues)[:-2],(torch.arange(num_residues)+2)[:-2]])
+    seq_edge_tail2 = torch.stack([(torch.arange(num_residues))[2:],(torch.arange(num_residues)-2)[2:]])
+    seq_edge_weight2 = torch.ones(seq_edge_head2.size(1) + seq_edge_tail2.size(1)) *contact_threshold
+    edge_index = torch.cat([edge_index, seq_edge_head2, seq_edge_tail2],dim=-1)
+    edge_weight = torch.cat([edge_weight, seq_edge_weight2],dim=-1)
+    ############### CONNECT ISOLATED NODES - Prevent Disconnected Residues ######################
 
-        edge_index, edge_weight = coalesce(edge_index, edge_weight, reduce='max')
-        edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce='max')
-        edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
-        edge_index, edge_weight = add_self_loops(edge_index, edge_weight,fill_value=1)
-        
-        return edge_index, edge_weight
-    except Exception as e:
-        print(f"Error in contact_map: {e}")
-        # Returnează un graf simplu în caz de eroare
-        num_residues = contact_map_proba.shape[0]
-        device = contact_map_proba.device
-        
-        # Creează un lanț simplu (fiecare nod conectat cu vecinii)
-        if num_residues > 1:
-            rows = torch.arange(num_residues-1, device=device)
-            cols = torch.arange(1, num_residues, device=device)
-            edge_index = torch.stack([rows, cols])
-            edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)  # Bidirectional
-            edge_weight = torch.ones(edge_index.shape[1], device=device)
-            return edge_index, edge_weight
-        else:
-            # În cazul unui singur reziduu, returnează un self-loop
-            return torch.tensor([[0], [0]], device=device), torch.tensor([1.0], device=device)
-
-
-
-def esm_extract(model, batch_converter, seq, layer=36, approach='mean', dim=2560):
-    device = next(model.parameters()).device
-    pro_id = 'A'
-    # Verifică dacă secvența este validă
-    if seq is None or len(seq) == 0:
-        print("Warning: Invalid sequence received in esm_extract")
-        # Returnează tensori goli dar valizi
-        empty_tensor = torch.zeros((len(seq) if seq else 1, dim), device=device)
-        empty_map = torch.zeros((len(seq) if seq else 1, len(seq) if seq else 1), device=device)
-        empty_logits = torch.zeros((len(seq) if seq else 1, layer), device=device)
-        return empty_tensor, empty_map, empty_logits
+    edge_index, edge_weight = coalesce(edge_index, edge_weight, reduce='max')
+    edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce='max')
+    edge_index, edge_weight = remove_self_loops(edge_index, edge_weight)
+    edge_index, edge_weight = add_self_loops(edge_index, edge_weight,fill_value=1)
     
-    try:
-        if len(seq) <= 700:
-            data = []
-            data.append((pro_id, seq))
-            batch_labels, batch_strs, batch_tokens = batch_converter(data)
-            batch_tokens = batch_tokens.to(device, non_blocking=True)
+    return edge_index, edge_weight
 
+
+
+def esm_extract(model, batch_converter, seq, layer=36, approach='mean',dim=2560):
+    pro_id = 'A'
+    if len(seq) <= 700:
+        data = []
+        data.append((pro_id, seq))
+        batch_labels, batch_strs, batch_tokens = batch_converter(data)
+        batch_tokens = batch_tokens.to(next(model.parameters()).device, non_blocking=True)
+
+        with torch.no_grad():
+            results = model(batch_tokens, repr_layers=[i for i in range(1, layer + 1)], return_contacts=True)
+
+        logits = results["logits"][0].cpu().numpy()[1: len(seq) + 1]
+        contact_prob_map = results["contacts"][0].cpu().numpy()
+        token_representation = torch.cat([results['representations'][i] for i in range(1, layer + 1)])
+        assert token_representation.size(0) == layer
+
+        if approach == 'last':
+            token_representation = token_representation[-1]
+        elif approach == 'sum':
+            token_representation = token_representation.sum(dim=0)
+        elif approach == 'mean':
+            token_representation = token_representation.mean(dim=0)
+
+        token_representation = token_representation.cpu().numpy()
+        token_representation = token_representation[1: len(seq) + 1]
+    else:
+        contact_prob_map = np.zeros((len(seq), len(seq)))  # global contact map prediction
+        token_representation = np.zeros((len(seq), dim))
+        logits = np.zeros((len(seq),layer))
+        interval = 350
+        i = math.ceil(len(seq) / interval)
+        # ======================
+        # =                    =
+        # =                    =
+        # =          ======================
+        # =          =*********=          =
+        # =          =*********=          =
+        # ======================          =
+        #            =                    =
+        #            =                    =
+        #            ======================
+        # where * is the overlapping area
+        # subsection seq contact map prediction
+        for s in range(i):
+            start = s * interval  # sub seq predict start
+            end = min((s + 2) * interval, len(seq))  # sub seq predict end
+            sub_seq_len = end - start
+
+            # prediction
+            temp_seq = seq[start:end]
+            temp_data = []
+            temp_data.append((pro_id, temp_seq))
+            batch_labels, batch_strs, batch_tokens = batch_converter(temp_data)
+            batch_tokens = batch_tokens.to(next(model.parameters()).device, non_blocking=True)
             with torch.no_grad():
                 results = model(batch_tokens, repr_layers=[i for i in range(1, layer + 1)], return_contacts=True)
 
-            # Asigură-te că toate rezultatele sunt pe același device înainte de a le converti la NumPy
-            logits = results["logits"][0].to(device)
-            contact_prob_map = results["contacts"][0].to(device)
-            token_representation = torch.cat([results['representations'][i].to(device) for i in range(1, layer + 1)])
+            # insert into the global contact map
+            row, col = np.where(contact_prob_map[start:end, start:end] != 0)
+            row = row + start
+            col = col + start
+            contact_prob_map[start:end, start:end] = contact_prob_map[start:end, start:end] + results["contacts"][
+                0].cpu().numpy()
+            contact_prob_map[row, col] = contact_prob_map[row, col] / 2.0
             
-            assert token_representation.size(0) == layer
+            logits[start:end] += results['logits'][0].cpu().numpy()[1: len(temp_seq) + 1]
+            logits[row] = logits[row]/2.0
 
+            ## TOKEN
+            subtoken_repr = torch.cat([results['representations'][i] for i in range(1, layer + 1)])
+            assert subtoken_repr.size(0) == layer
             if approach == 'last':
-                token_representation = token_representation[-1]
+                subtoken_repr = subtoken_repr[-1]
             elif approach == 'sum':
-                token_representation = token_representation.sum(dim=0)
+                subtoken_repr = subtoken_repr.sum(dim=0)
             elif approach == 'mean':
-                token_representation = token_representation.mean(dim=0)
+                subtoken_repr = subtoken_repr.mean(dim=0)
 
-            # Convert to CPU then NumPy
-            token_representation = token_representation.cpu().numpy()
-            logits = logits.cpu().numpy()[1: len(seq) + 1]
-            contact_prob_map = contact_prob_map.cpu().numpy()
-            token_representation = token_representation[1: len(seq) + 1]
-            
-            # Verifică rezultatele
-            if token_representation.shape[0] != len(seq) or contact_prob_map.shape[0] != len(seq):
-                print(f"Warning: Dimension mismatch in ESM results. Sequence length: {len(seq)}, token_repr shape: {token_representation.shape}, contact_map shape: {contact_prob_map.shape}")
-                
-                # Ajustează dimensiunile dacă e necesar
-                if token_representation.shape[0] != len(seq):
-                    token_representation = np.zeros((len(seq), dim))
-                if contact_prob_map.shape[0] != len(seq) or contact_prob_map.shape[1] != len(seq):
-                    contact_prob_map = np.zeros((len(seq), len(seq)))
-            else:
-                contact_prob_map = np.zeros((len(seq), len(seq)))  # global contact map prediction
-                token_representation = np.zeros((len(seq), dim))
-                logits = np.zeros((len(seq),layer))
-                interval = 350
-                i = math.ceil(len(seq) / interval)
-                # ======================
-                # =                    =
-                # =                    =
-                # =          ======================
-                # =          =*********=          =
-                # =          =*********=          =
-                # ======================          =
-                #            =                    =
-                #            =                    =
-                #            ======================
-                # where * is the overlapping area
-                # subsection seq contact map prediction
-                for s in range(i):
-                    start = s * interval  # sub seq predict start
-                    end = min((s + 2) * interval, len(seq))  # sub seq predict end
-                    sub_seq_len = end - start
+            subtoken_repr = subtoken_repr.cpu().numpy()
+            subtoken_repr = subtoken_repr[1: len(temp_seq) + 1]
 
-                    # prediction
-                    temp_seq = seq[start:end]
-                    temp_data = []
-                    temp_data.append((pro_id, temp_seq))
-                    batch_labels, batch_strs, batch_tokens = batch_converter(temp_data)
-                    batch_tokens = batch_tokens.to(next(model.parameters()).device, non_blocking=True)
-                    with torch.no_grad():
-                        results = model(batch_tokens, repr_layers=[i for i in range(1, layer + 1)], return_contacts=True)
+            trow = np.where(token_representation[start:end].sum(axis=-1) != 0)[0]
+            trow = trow + start
+            token_representation[start:end] = token_representation[start:end] + subtoken_repr
+            token_representation[trow] = token_representation[trow] / 2.0
 
-                    # insert into the global contact map
-                    row, col = np.where(contact_prob_map[start:end, start:end] != 0)
-                    row = row + start
-                    col = col + start
-                    contact_prob_map[start:end, start:end] = contact_prob_map[start:end, start:end] + results["contacts"][
-                        0].cpu().numpy()
-                    contact_prob_map[row, col] = contact_prob_map[row, col] / 2.0
-                    
-                    logits[start:end] += results['logits'][0].cpu().numpy()[1: len(temp_seq) + 1]
-                    logits[row] = logits[row]/2.0
+            if end == len(seq):
+                break
 
-                    ## TOKEN
-                    subtoken_repr = torch.cat([results['representations'][i] for i in range(1, layer + 1)])
-                    assert subtoken_repr.size(0) == layer
-                    if approach == 'last':
-                        subtoken_repr = subtoken_repr[-1]
-                    elif approach == 'sum':
-                        subtoken_repr = subtoken_repr.sum(dim=0)
-                    elif approach == 'mean':
-                        subtoken_repr = subtoken_repr.mean(dim=0)
-
-                    subtoken_repr = subtoken_repr.cpu().numpy()
-                    subtoken_repr = subtoken_repr[1: len(temp_seq) + 1]
-
-                    trow = np.where(token_representation[start:end].sum(axis=-1) != 0)[0]
-                    trow = trow + start
-                    token_representation[start:end] = token_representation[start:end] + subtoken_repr
-                    token_representation[trow] = token_representation[trow] / 2.0
-
-                    if end == len(seq):
-                        break
-
-    except Exception as e:
-        print(f"Error in esm_extract: {e}")
-        # Returnează tensori goli dar valizi în caz de eroare
-        empty_tensor = torch.zeros((len(seq), dim), device=device)
-        empty_map = torch.zeros((len(seq), len(seq)), device=device)
-        empty_logits = torch.zeros((len(seq), layer), device=device)
-        return empty_tensor, empty_map, empty_logits
-
-    return torch.from_numpy(token_representation).to(device), torch.from_numpy(contact_prob_map).to(device), torch.from_numpy(logits).to(device)
+    return torch.from_numpy(token_representation), torch.from_numpy(contact_prob_map), torch.from_numpy(logits)
 
 
 
