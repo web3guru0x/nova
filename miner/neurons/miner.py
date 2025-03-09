@@ -27,7 +27,7 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 16384  # Increased from 2048
+        self.chunk_size = 4096  # Increased from 2048
         self.tolerance = 3
         self.high_score_threshold = 9.0  # New threshold for early submission
         self.num_parallel_inferences = 4  # Number of parallel inference tasks
