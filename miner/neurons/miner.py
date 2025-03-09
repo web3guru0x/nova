@@ -36,7 +36,7 @@ class Miner:
         
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 128
+        self.chunk_size = 1024
         self.tolerance = 3
 
         self.config = self.get_config()
