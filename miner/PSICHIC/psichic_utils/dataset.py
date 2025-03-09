@@ -1,6 +1,5 @@
 import torch.utils.data
 from torch_geometric.data import Dataset
-# from torch.utils.data import Dataset
 import torch
 import pandas as pd
 from torch_geometric.data import Data
@@ -19,7 +18,7 @@ device = RuntimeConfig.DEVICE
 
 
 class ProteinMoleculeDataset(Dataset):
-    def __init__(self, sequence_data, mol_obj, prot_obj, device=device, cache_transform=True):
+    def __init__(self, sequence_data, mol_obj, prot_obj, device="cuda:0", cache_transform=True):
         super(ProteinMoleculeDataset, self).__init__()
 
         if isinstance(sequence_data,pd.core.frame.DataFrame):
@@ -52,35 +51,36 @@ class ProteinMoleculeDataset(Dataset):
 
         if self.cache_transform:
             for _, v in self.mols.items():
-                v['atom_idx'] = v['atom_idx'].long().view(-1, 1)
-                v['atom_feature'] = v['atom_feature'].float()
-                adj = v['bond_feature'].long()
-                mol_edge_index =  adj.nonzero(as_tuple=False).t().contiguous()
+                v['atom_idx'] = v['atom_idx'].long().view(-1, 1).cuda(non_blocking=True)
+                v['atom_feature'] = v['atom_feature'].float().cuda(non_blocking=True)
+                adj = v['bond_feature'].long().cuda(non_blocking=True)
+                mol_edge_index = adj.nonzero(as_tuple=False).t().contiguous()
                 v['atom_edge_index'] = mol_edge_index
                 v['atom_edge_attr'] = adj[mol_edge_index[0], mol_edge_index[1]].long()
                 v['atom_num_nodes'] = v['atom_idx'].shape[0]
 
                 ## Clique
-                v['x_clique'] = v['x_clique'].long().view(-1, 1)
+                v['x_clique'] = v['x_clique'].long().view(-1, 1).cuda(non_blocking=True)
                 v['clique_num_nodes'] = v['x_clique'].shape[0]
-                v['tree_edge_index'] = v['tree_edge_index'].long()
-                v['atom2clique_index'] = v['atom2clique_index'].long()
+                v['tree_edge_index'] = v['tree_edge_index'].long().cuda(non_blocking=True)
+                v['atom2clique_index'] = v['atom2clique_index'].long().cuda(non_blocking=True)
 
             for _, v in self.prots.items():
-                v['seq_feat'] = v['seq_feat'].float()
-                v['token_representation'] = v['token_representation'].float()
+                v['seq_feat'] = v['seq_feat'].float().cuda(non_blocking=True)
+                v['token_representation'] = v['token_representation'].float().cuda(non_blocking=True)
                 v['num_nodes'] = len(v['seq'])
-                v['node_pos'] = torch.arange(len(v['seq'])).reshape(-1,1)
-                v['edge_weight'] = v['edge_weight'].float()
+                v['node_pos'] = torch.arange(len(v['seq'])).reshape(-1,1).cuda(non_blocking=True)
+                v['edge_weight'] = v['edge_weight'].float().cuda(non_blocking=True)
+                v['edge_index'] = v['edge_index'].cuda(non_blocking=True)
 
     def get(self, index):
         return self.__getitem__(index)
 
     def len(self):
         return self.__len__()
+        
     def __len__(self):
         return len(self.pairs)
-
 
     def __getitem__(self, idx):
         # Extract data
@@ -88,20 +88,19 @@ class ProteinMoleculeDataset(Dataset):
         prot_key = self.pairs.loc[idx,'Protein'] 
         try: 
             reg_y = self.pairs.loc[idx,'regression_label'] 
-            reg_y = torch.tensor(reg_y).float()
+            reg_y = torch.tensor(reg_y).float().cuda(non_blocking=True)
         except KeyError:
             reg_y = None
         
-
         try: 
             cls_y = self.pairs.loc[idx,'classification_label'] 
-            cls_y = torch.tensor(cls_y).float()
+            cls_y = torch.tensor(cls_y).float().cuda(non_blocking=True)
         except KeyError:
             cls_y = None
         
         try: 
             mcls_y = self.pairs.loc[idx,'multiclass_label'] 
-            mcls_y = torch.tensor(mcls_y + 1).float()
+            mcls_y = torch.tensor(mcls_y + 1).float().cuda(non_blocking=True)
         except KeyError:
             mcls_y = None
             
@@ -113,7 +112,7 @@ class ProteinMoleculeDataset(Dataset):
             ## atom
             mol_x = mol['atom_idx']
             mol_x_feat = mol['atom_feature']
-            mol_edge_index  = mol['atom_edge_index']
+            mol_edge_index = mol['atom_edge_index']
             mol_edge_attr = mol['atom_edge_attr']
             mol_num_nodes = mol['atom_num_nodes']
 
@@ -132,32 +131,31 @@ class ProteinMoleculeDataset(Dataset):
             prot_edge_weight = prot['edge_weight']
         else:
             # MOL
-            mol_x = mol['atom_idx'].long().view(-1, 1)
-            mol_x_feat = mol['atom_feature'].float()
-            adj = mol['bond_feature'].long()
+            mol_x = mol['atom_idx'].long().view(-1, 1).cuda(non_blocking=True)
+            mol_x_feat = mol['atom_feature'].float().cuda(non_blocking=True)
+            adj = mol['bond_feature'].long().cuda(non_blocking=True)
             mol_edge_index = adj.nonzero(as_tuple=False).t().contiguous()
-            mol_edge_attr = adj[mol_edge_index[0], mol_edge_index[1]].long()
+            mol_edge_attr = adj[mol_edge_index[0], mol_edge_index[1]].long().cuda(non_blocking=True)
             mol_num_nodes = mol_x.shape[0]
 
             ## Clique
-            mol_x_clique = mol['x_clique'].long().view(-1, 1)
+            mol_x_clique = mol['x_clique'].long().view(-1, 1).cuda(non_blocking=True)
             clique_num_nodes = mol_x_clique.shape[0]
-            clique_edge_index = mol['tree_edge_index'].long()
-            atom2clique_index = mol['atom2clique_index'].long()
-
+            clique_edge_index = mol['tree_edge_index'].long().cuda(non_blocking=True)
+            atom2clique_index = mol['atom2clique_index'].long().cuda(non_blocking=True)
 
             prot_seq = prot['seq']
-            prot_node_aa = prot['seq_feat'].float()
-            prot_node_evo = prot['token_representation'].float()
+            prot_node_aa = prot['seq_feat'].float().cuda(non_blocking=True)
+            prot_node_evo = prot['token_representation'].float().cuda(non_blocking=True)
             prot_num_nodes = len(prot['seq'])
-            prot_node_pos = torch.arange(len(prot['seq'])).reshape(-1,1)
-            prot_edge_index = prot['edge_index']
-            prot_edge_weight = prot['edge_weight'].float()
+            prot_node_pos = torch.arange(len(prot['seq'])).reshape(-1,1).cuda(non_blocking=True)
+            prot_edge_index = prot['edge_index'].cuda(non_blocking=True)
+            prot_edge_weight = prot['edge_weight'].float().cuda(non_blocking=True)
 
         out = MultiGraphData(
                 ## MOLECULE
                 mol_x=mol_x, mol_x_feat=mol_x_feat, mol_edge_index=mol_edge_index,
-                mol_edge_attr=mol_edge_attr, mol_num_nodes= mol_num_nodes,
+                mol_edge_attr=mol_edge_attr, mol_num_nodes=mol_num_nodes,
                 clique_x=mol_x_clique, clique_edge_index=clique_edge_index, atom2clique_index=atom2clique_index,
                 clique_num_nodes=clique_num_nodes,
                 ## PROTEIN
@@ -168,7 +166,7 @@ class ProteinMoleculeDataset(Dataset):
                 ## Y output
                 reg_y=reg_y, cls_y=cls_y, mcls_y=mcls_y,
                 ## keys
-                mol_key = mol_key, prot_key = prot_key
+                mol_key=mol_key, prot_key=prot_key
         )
 
         return out

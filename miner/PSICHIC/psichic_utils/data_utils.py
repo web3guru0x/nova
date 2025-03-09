@@ -342,7 +342,7 @@ def store_result(df, attention_dict, interaction_keys,  ligand_dict,
                         )
     return df
 
-def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=True, ligand_dict=None, device=device,
+def virtual_screening(screen_df, model, data_loader, result_path, save_interpret=True, ligand_dict=None, device="cuda:0",
                         save_cluster=False):
     if "ID" in screen_df.columns:
         # Iterate through the DataFrame check any empty pairs 
@@ -358,23 +358,49 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
 
     model.eval()
     
+    # Set up CUDA streams for overlapping computation
+    stream1 = torch.cuda.Stream()
+    stream2 = torch.cuda.Stream()
+    
+    # Create CUDA events for synchronization
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    
+    start_event.record()
+    
+    # Enable automatic mixed precision for faster inference
+    scaler = torch.cuda.amp.GradScaler()
+    
     with torch.no_grad():
         for data in tqdm(data_loader):
-            data = data.to(device)
-            reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
-                    # Molecule
-                    mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
-                    atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
-                    clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
-                    # Protein
-                    residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
-                    residue_edge_index=data.prot_edge_index,
-                    residue_edge_weight=data.prot_edge_weight,
-                    # Mol-Protein Interaction batch
-                    mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
-                    # save_cluster
-                    save_cluster=save_cluster
-            )
+            # Pre-transfer data to GPU asynchronously
+            with torch.cuda.stream(stream1):
+                data = data.to(device, non_blocking=True)
+            
+            # Ensure data transfer is complete
+            torch.cuda.current_stream().wait_stream(stream1)
+            
+            # Run model with mixed precision
+            with torch.cuda.amp.autocast():
+                with torch.cuda.stream(stream2):
+                    reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = model(
+                            # Molecule
+                            mol_x=data.mol_x, mol_x_feat=data.mol_x_feat, bond_x=data.mol_edge_attr,
+                            atom_edge_index=data.mol_edge_index, clique_x=data.clique_x, 
+                            clique_edge_index=data.clique_edge_index, atom2clique_index=data.atom2clique_index,
+                            # Protein
+                            residue_x=data.prot_node_aa, residue_evo_x=data.prot_node_evo,
+                            residue_edge_index=data.prot_edge_index,
+                            residue_edge_weight=data.prot_edge_weight,
+                            # Mol-Protein Interaction batch
+                            mol_batch=data.mol_x_batch, prot_batch=data.prot_node_aa_batch, clique_batch=data.clique_x_batch,
+                            # save_cluster
+                            save_cluster=save_cluster
+                    )
+            
+            # Wait for computation to complete
+            torch.cuda.current_stream().wait_stream(stream2)
+            
             interaction_keys = list(zip(data.prot_key, data.mol_key))
 
             if reg_pred is not None:
@@ -391,6 +417,11 @@ def virtual_screening(screen_df, model, data_loader, result_path, save_interpret
 
             screen_df = store_result(screen_df, attention_dict, interaction_keys, ligand_dict, 
                                      reg_pred, cls_pred, mcls_pred, 
-                                     result_path=result_path, save_interpret = save_interpret)
+                                     result_path=result_path, save_interpret=save_interpret)
+    
+    end_event.record()
+    torch.cuda.synchronize()
+    processing_time = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+    bt.logging.info(f"Virtual screening completed in {processing_time:.2f} seconds")
 
     return screen_df

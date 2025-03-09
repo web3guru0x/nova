@@ -89,19 +89,29 @@ def get_spearman(y,f):
     return sp
 
 def evaluate_reg(Y, F):
-    not_nan_indices = ~np.isnan(Y)
+    # Make sure we're working with tensors
+    if not isinstance(Y, torch.Tensor):
+        Y = torch.tensor(Y, device='cuda:0')
+    if not isinstance(F, torch.Tensor):
+        F = torch.tensor(F, device='cuda:0')
+    
+    not_nan_indices = ~torch.isnan(Y)
     Y = Y[not_nan_indices]
     F = F[not_nan_indices]
     
+    # Move to CPU only for final calculations that use numpy
+    Y_cpu = Y.cpu().numpy()
+    F_cpu = F.cpu().numpy()
+    
     return { 
-        'mse': float(get_mse(Y,F)),
-        'rmse': float(get_rmse(Y,F)),
-        'mae': float(get_mae(Y,F)),
-        'sd': float(get_sd(Y,F)),
-        'pearson': float(get_pearson(Y,F)),
-        'spearman': float(get_spearman(Y,F)),
-        'rm2': float(get_rm2(Y,F)),
-        'ci': float(get_cindex(Y,F))
+        'mse': float(get_mse(Y_cpu, F_cpu)),
+        'rmse': float(get_rmse(Y_cpu, F_cpu)),
+        'mae': float(get_mae(Y_cpu, F_cpu)),
+        'sd': float(get_sd(Y_cpu, F_cpu)),
+        'pearson': float(get_pearson(Y_cpu, F_cpu)),
+        'spearman': float(get_spearman(Y_cpu, F_cpu)),
+        'rm2': float(get_rm2(Y_cpu, F_cpu)),
+        'ci': float(get_cindex(Y_cpu, F_cpu))
     }
 
 def evaluate_cls(Y,P,threshold=0.5):

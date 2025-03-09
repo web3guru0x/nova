@@ -115,12 +115,9 @@ class net(torch.nn.Module):
                 dropout=dropout
             ))
 
-            # self.cluster.append(SAGECluster([hidden_channels, hidden_channels*2, self.num_cluster[idx]],
-            #                     in_norm=True, add_self_loops=True, root_weight=False))
-            # self.cluster.append(MLP([hidden_channels*2, hidden_channels*2, self.num_cluster[idx]]))
+            # Use GCNCluster with in_norm=True for better performance
             self.cluster.append(GCNCluster([hidden_channels, hidden_channels*2, self.num_cluster[idx]], in_norm=True))
-            # self.cluster.append(SGCluster(hidden_channels, self.num_cluster[idx], K=2))
-            # self.cluster.append(APPNPCluster(hidden_channels, self.num_cluster[idx],a=0.1, K=10))
+            
             self.inter_convs.append(DrugProteinConv(
                 atom_channels=hidden_channels,
                 residue_channels=hidden_channels,
@@ -133,8 +130,8 @@ class net(torch.nn.Module):
             self.mol_norms.append(torch.nn.LayerNorm(hidden_channels))
             self.prot_norms.append(torch.nn.LayerNorm(hidden_channels))
             
-            self.atom_lins.append( Linear(hidden_channels, hidden_channels, bias=False) )
-            self.residue_lins.append( Linear(hidden_channels, hidden_channels, bias=False) )
+            self.atom_lins.append(Linear(hidden_channels, hidden_channels, bias=False))
+            self.residue_lins.append(Linear(hidden_channels, hidden_channels, bias=False))
 
             self.c2a_mlps.append(MLP([hidden_channels, hidden_channels * 2, hidden_channels], bias=False))
             self.c2r_mlps.append(MLP([hidden_channels, hidden_channels * 2, hidden_channels], bias=False))
@@ -142,8 +139,8 @@ class net(torch.nn.Module):
             self.mol_gn2.append(GraphNorm(hidden_channels))
             self.prot_gn2.append(GraphNorm(hidden_channels))
 
-        self.atom_attn_lin = PosLinear(heads * total_layer, 1, bias=False, init_value= 1 / heads) #(heads * total_layer))
-        self.residue_attn_lin = PosLinear(heads * total_layer, 1, bias=False, init_value= 1 / heads) #(heads * total_layer))
+        self.atom_attn_lin = PosLinear(heads * total_layer, 1, bias=False, init_value=1/heads)
+        self.residue_attn_lin = PosLinear(heads * total_layer, 1, bias=False, init_value=1/heads)
         
         self.mol_out= MLP([hidden_channels, hidden_channels * 2, hidden_channels], out_norm=True)
         self.prot_out = MLP([hidden_channels, hidden_channels * 2, hidden_channels], out_norm=True)
@@ -210,156 +207,158 @@ class net(torch.nn.Module):
                 mol_batch=None, prot_batch=None, clique_batch=None,
                 ## only if you're interested in clustering algorithm 
                 save_cluster = False):
-        # Init variables        
-        reg_pred = None
-        cls_pred = None
-        mcls_pred = None
-        residue_edge_attr = _rbf(residue_edge_weight, D_max=1.0, D_count=self.prot_edge_dim, device=self.device)
-        # residue_edge_attr = None
-        mol_pool_feat = []
-        prot_pool_feat = []
+        # Use automatic mixed precision for better performance
+        with torch.cuda.amp.autocast():
+            # Init variables        
+            reg_pred = None
+            cls_pred = None
+            mcls_pred = None
+            residue_edge_attr = _rbf(residue_edge_weight, D_max=1.0, D_count=self.prot_edge_dim, device=self.device)
+            # residue_edge_attr = None
+            mol_pool_feat = []
+            prot_pool_feat = []
 
-        # PROTEIN Featurize
-        residue_x = self.prot_aa(residue_x) + self.prot_evo(residue_evo_x)
-       
-        # MOLECULE Featurize
-        atom_x = self.atom_type_encoder(mol_x.squeeze()) + self.atom_feat_encoder(mol_x_feat)
+            # PROTEIN Featurize
+            residue_x = self.prot_aa(residue_x) + self.prot_evo(residue_evo_x)
+        
+            # MOLECULE Featurize
+            atom_x = self.atom_type_encoder(mol_x.squeeze()) + self.atom_feat_encoder(mol_x_feat)
 
-        # Clique Featurize
-        clique_x = self.clique_encoder(clique_x.squeeze())
-        spectral_loss = torch.tensor(0.).to(self.device)
-        ortho_loss = torch.tensor(0.).to(self.device)
-        cluster_loss = torch.tensor(0.).to(self.device)
+            # Clique Featurize
+            clique_x = self.clique_encoder(clique_x.squeeze())
+            spectral_loss = torch.tensor(0., device=self.device)
+            ortho_loss = torch.tensor(0., device=self.device)
+            cluster_loss = torch.tensor(0., device=self.device)
 
-        clique_scores = []
-        residue_scores = []
-        layer_s = {}
-        # MOLECULE-PROTEIN Layers
-        for idx in range(self.total_layer):
-            atom_x = self.mol_convs[idx](atom_x, bond_x, atom_edge_index)
-            residue_x = self.prot_convs[idx](residue_x, residue_edge_index, residue_edge_attr)
+            clique_scores = []
+            residue_scores = []
+            layer_s = {}
+            
+            # Create streams for parallel processing
+            stream1 = torch.cuda.Stream()
+            stream2 = torch.cuda.Stream()
+            
+            # MOLECULE-PROTEIN Layers
+            for idx in range(self.total_layer):
+                # Process molecule in stream1
+                with torch.cuda.stream(stream1):
+                    atom_x = self.mol_convs[idx](atom_x, bond_x, atom_edge_index)
+                
+                # Process protein in stream2
+                with torch.cuda.stream(stream2):
+                    residue_x = self.prot_convs[idx](residue_x, residue_edge_index, residue_edge_attr)
+                
+                # Synchronize streams
+                torch.cuda.current_stream().wait_stream(stream1)
+                torch.cuda.current_stream().wait_stream(stream2)
 
-            ## Pool Drug
-            drug_x, clique_x, clique_score = self.mol_pools[idx](atom_x, clique_x, atom2clique_index, clique_batch, clique_edge_index)
-            drug_x = self.mol_norms[idx](drug_x)
-            clique_scores.append(clique_score)
+                ## Pool Drug
+                drug_x, clique_x, clique_score = self.mol_pools[idx](atom_x, clique_x, atom2clique_index, clique_batch, clique_edge_index)
+                drug_x = self.mol_norms[idx](drug_x)
+                clique_scores.append(clique_score)
 
-            ## Cluster protein residues
-            dropped_residue_edge_index, _ = dropout_edge(residue_edge_index, p=self.dropout_cluster_edge, 
+                ## Cluster protein residues
+                dropped_residue_edge_index, _ = dropout_edge(residue_edge_index, p=self.dropout_cluster_edge, 
                                                          force_undirected=True,training=self.training)
-            s = self.cluster[idx](residue_x, dropped_residue_edge_index)
-            residue_hx, residue_mask = to_dense_batch(residue_x, prot_batch)
+                s = self.cluster[idx](residue_x, dropped_residue_edge_index)
+                residue_hx, residue_mask = to_dense_batch(residue_x, prot_batch)
 
-            if save_cluster:
-                layer_s[idx] = s 
+                if save_cluster:
+                    layer_s[idx] = s 
 
-            # cluster features
-            s, _ = to_dense_batch(s, prot_batch)
-            residue_adj = to_dense_adj(residue_edge_index, prot_batch)
-            cluster_mask = residue_mask 
+                # cluster features
+                s, _ = to_dense_batch(s, prot_batch)
+                residue_adj = to_dense_adj(residue_edge_index, prot_batch)
+                cluster_mask = residue_mask 
 
-            cluster_drop_mask = None
-            if self.drop_residue != 0 and self.training:
-                _, _, residue_drop_mask = dropout_node(residue_edge_index, self.drop_residue, residue_x.size(0), prot_batch,
+                cluster_drop_mask = None
+                if self.drop_residue != 0 and self.training:
+                    _, _, residue_drop_mask = dropout_node(residue_edge_index, self.drop_residue, residue_x.size(0), prot_batch,
                                                        self.training)  # drop residue for regularization
-                residue_drop_mask, _ = to_dense_batch(residue_drop_mask.reshape(-1,1), prot_batch) # drop residue for regularization
-                residue_drop_mask = residue_drop_mask.squeeze()
-                cluster_drop_mask = residue_mask * residue_drop_mask.squeeze()
+                    residue_drop_mask, _ = to_dense_batch(residue_drop_mask.reshape(-1,1), prot_batch) # drop residue for regularization
+                    residue_drop_mask = residue_drop_mask.squeeze()
+                    cluster_drop_mask = residue_mask * residue_drop_mask.squeeze()
 
-            s, cluster_x, residue_adj, cl_loss, o_loss = dense_mincut_pool(residue_hx, residue_adj, s, cluster_mask, cluster_drop_mask)
-            
-            # spectral_loss += sp_loss
-            ortho_loss += o_loss
-            cluster_loss += cl_loss
-            cluster_x = self.prot_norms[idx](cluster_x)
-            
-            # connect drug and protein cluster
-            batch_size = s.size(0)
-            cluster_residue_batch = torch.arange(batch_size).repeat_interleave(self.num_cluster[idx]).to(self.device)
-            cluster_x = cluster_x.reshape(batch_size*self.num_cluster[idx], -1)                
-            p2m_edge_index = torch.stack([torch.arange(batch_size*self.num_cluster[idx]),
-                                            torch.arange(batch_size).repeat_interleave(self.num_cluster[idx])]
-                                        ).to(self.device)
+                s, cluster_x, residue_adj, cl_loss, o_loss = dense_mincut_pool(residue_hx, residue_adj, s, cluster_mask, cluster_drop_mask)
+                
+                # spectral_loss += sp_loss
+                ortho_loss += o_loss
+                cluster_loss += cl_loss
+                cluster_x = self.prot_norms[idx](cluster_x)
+                
+                # connect drug and protein cluster
+                batch_size = s.size(0)
+                cluster_residue_batch = torch.arange(batch_size, device=self.device).repeat_interleave(self.num_cluster[idx])
+                cluster_x = cluster_x.reshape(batch_size*self.num_cluster[idx], -1)                
+                p2m_edge_index = torch.stack([torch.arange(batch_size*self.num_cluster[idx], device=self.device),
+                                            torch.arange(batch_size, device=self.device).repeat_interleave(self.num_cluster[idx])]
+                                        )
 
-            ## model interative relationship
-            clique_x, cluster_x, inter_attn = self.inter_convs[idx](drug_x, clique_x, clique_batch, cluster_x, p2m_edge_index)
-            inter_attn = inter_attn[1]
+                ## model interative relationship
+                clique_x, cluster_x, inter_attn = self.inter_convs[idx](drug_x, clique_x, clique_batch, cluster_x, p2m_edge_index)
+                inter_attn = inter_attn[1]
 
-            # Residual
+                # Residual
+                row, col = atom2clique_index
+                atom_x = atom_x + F.relu(self.atom_lins[idx](scatter(clique_x[col], row, dim=0, dim_size=atom_x.size(0), reduce='mean')))  # clique -> atom
+                atom_x = atom_x + self.c2a_mlps[idx](atom_x)
+                atom_x = F.dropout(atom_x, self.dropout, training=self.training)
+
+                residue_hx, _ = to_dense_batch(cluster_x, cluster_residue_batch)
+                inter_attn, _ = to_dense_batch(inter_attn, cluster_residue_batch)
+                residue_x = residue_x + F.relu(self.residue_lins[idx]((s @ residue_hx)[residue_mask])) # cluster -> residue
+                residue_x = residue_x + self.c2r_mlps[idx](residue_x)
+                
+                residue_x = F.dropout(residue_x, self.dropout, training=self.training)
+                inter_attn = (s @ inter_attn)[residue_mask]
+                residue_scores.append(inter_attn)
+
+                ## Graph Normalization
+                atom_x = self.mol_gn2[idx](atom_x, mol_batch)
+                residue_x = self.prot_gn2[idx](residue_x, prot_batch)
+        
+            # Pool based on attn scores
             row, col = atom2clique_index
-            atom_x = atom_x + F.relu( self.atom_lins[idx](scatter(clique_x[col], row, dim=0, dim_size=atom_x.size(0), reduce='mean')) )  # clique -> atom
-            atom_x = atom_x + self.c2a_mlps[idx](atom_x)
-            atom_x = F.dropout(atom_x, self.dropout, training=self.training)
-
-            residue_hx, _ = to_dense_batch(cluster_x, cluster_residue_batch)
-            inter_attn, _ = to_dense_batch(inter_attn, cluster_residue_batch)
-            residue_x = residue_x + F.relu( self.residue_lins[idx]((s @ residue_hx)[residue_mask]) ) # cluster -> residue
-            residue_x = residue_x + self.c2r_mlps[idx](residue_x)
+            clique_scores = torch.cat(clique_scores, dim=-1)
+            atom_scores = scatter(clique_scores[col], row, dim=0, dim_size=atom_x.size(0), reduce='mean')
+            atom_score = self.atom_attn_lin(atom_scores)
+            atom_score = softmax(atom_score, mol_batch)
+            mol_pool_feat = global_add_pool(atom_x * atom_score, mol_batch)
             
-            residue_x = F.dropout(residue_x, self.dropout, training=self.training)
-            inter_attn = (s @ inter_attn)[residue_mask]
-            residue_scores.append(inter_attn)
+            residue_scores = torch.cat(residue_scores, dim=-1)
+            residue_score = softmax(self.residue_attn_lin(residue_scores), prot_batch)
+            prot_pool_feat = global_add_pool(residue_x * residue_score, prot_batch)
+            
+            mol_pool_feat = self.mol_out(mol_pool_feat)
+            prot_pool_feat = self.prot_out(prot_pool_feat)
+            
+            mol_prot_feat = torch.cat([mol_pool_feat, prot_pool_feat], dim=-1)
+            
+            if self.regression_head:
+                reg_pred = self.reg_out(mol_prot_feat)
+            if self.classification_head:
+                cls_pred = self.cls_out(mol_prot_feat)
+            if self.multiclassification_head:
+                mcls_pred = self.mcls_out(mol_prot_feat)
 
-            ## Graph Normalization
-            atom_x = self.mol_gn2[idx](atom_x, mol_batch)
-            residue_x = self.prot_gn2[idx](residue_x, prot_batch)
-    
-        # Pool based on attn scores
-        row, col = atom2clique_index
-        # clique_scores = torch.cat(clique_scores, dim=-1)
-        # atom_scores = scatter(clique_scores[col], row, dim=0, dim_size=atom_x.size(0), reduce='mean')
-        # atom_scores_normalizer = 1 / ( global_add_pool(atom_scores, mol_batch)[mol_batch] + EPS)
-        # atom_score = self.atom_attn_lin(atom_scores * atom_scores_normalizer)
-        # atom_score = softmax(atom_score, mol_batch)
-        clique_scores = torch.cat(clique_scores, dim=-1)
-        atom_scores = scatter(clique_scores[col], row, dim=0, dim_size=atom_x.size(0), reduce='mean')
-        atom_score = self.atom_attn_lin(atom_scores)
-        atom_score = softmax(atom_score, mol_batch)
-        mol_pool_feat = global_add_pool(atom_x * atom_score, mol_batch)
-        
-        # residue_scores = torch.cat(residue_scores, dim=-1)
-        # residue_scores_normalizer = 1 / ( global_add_pool(residue_scores, prot_batch)[prot_batch] + EPS)
-        # residue_score = self.residue_attn_lin(residue_scores * residue_scores_normalizer)
-        # residue_score = softmax(residue_score, prot_batch)
-
-        residue_scores = torch.cat(residue_scores, dim=-1)
-        residue_score = softmax(self.residue_attn_lin(residue_scores),prot_batch)
-        prot_pool_feat = global_add_pool(residue_x * residue_score, prot_batch)
-        
-        mol_pool_feat = self.mol_out(mol_pool_feat)
-        prot_pool_feat = self.prot_out(prot_pool_feat)
-        
-        mol_prot_feat = torch.cat([mol_pool_feat, prot_pool_feat], dim=-1)
-        
-        if self.regression_head:
-            reg_pred = self.reg_out(mol_prot_feat)
-        if self.classification_head:
-            cls_pred = self.cls_out(mol_prot_feat)
-        if self.multiclassification_head:
-            mcls_pred = self.mcls_out(mol_prot_feat)
-
-        attention_dict = {
-            'residue_final_score':residue_score,
-            'atom_final_score': atom_score,
-            'clique_layer_scores':clique_scores,
-            'residue_layer_scores':residue_scores,
-            'drug_atom_index':mol_batch,
-            'drug_clique_index':clique_batch,
-            'protein_residue_index':prot_batch, 
-            'mol_feature': mol_pool_feat,
-            'prot_feature':prot_pool_feat,
-            'interaction_fingerprint':mol_prot_feat,
-            'cluster_s': layer_s
-
-        }
+            attention_dict = {
+                'residue_final_score': residue_score,
+                'atom_final_score': atom_score,
+                'clique_layer_scores': clique_scores,
+                'residue_layer_scores': residue_scores,
+                'drug_atom_index': mol_batch,
+                'drug_clique_index': clique_batch,
+                'protein_residue_index': prot_batch, 
+                'mol_feature': mol_pool_feat,
+                'prot_feature': prot_pool_feat,
+                'interaction_fingerprint': mol_prot_feat,
+                'cluster_s': layer_s
+            }
         
         return reg_pred, cls_pred, mcls_pred, spectral_loss, ortho_loss, cluster_loss, attention_dict
     
     def temperature_clamp(self):
         pass
-        # with torch.no_grad():
-        #     for m in self.cluster:
-        #         m.logit_scale.clamp_(0, math.log(100))
     
     def connect_mol_prot(self, mol_batch, prot_batch):
         mol_num_nodes = mol_batch.size(0)
@@ -403,8 +402,6 @@ class net(torch.nn.Module):
                 if pn.endswith('bias') or pn.endswith('mean_scale'):# or pn.endswith('logit_scale'):
                     # all biases will not be decayed
                     no_decay.add(fpn)
-                    # if mn.startswith('cluster'):
-                    #     print(mn, 'not decayed!')
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
                     decay.add(fpn)
@@ -478,7 +475,7 @@ class net(torch.nn.Module):
         return optimizer
     
 
-def _rbf(D, D_min=0., D_max=1., D_count=16, device='cpu'):
+def _rbf(D, D_min=0., D_max=1., D_count=16, device='cuda:0'):
     '''
     From https://github.com/jingraham/neurips19-graph-protein-design
 
@@ -486,7 +483,7 @@ def _rbf(D, D_min=0., D_max=1., D_count=16, device='cpu'):
     That is, if `D` has shape [...dims], then the returned tensor will have
     shape [...dims, D_count].
     '''
-    D = torch.where(D < D_max, D, torch.tensor(D_max).float().to(device) )
+    D = torch.where(D < D_max, D, torch.tensor(D_max, dtype=torch.float, device=device))
     D_mu = torch.linspace(D_min, D_max, D_count, device=device)
     D_mu = D_mu.view([1, -1])
     D_sigma = (D_max - D_min) / D_count
@@ -494,6 +491,8 @@ def _rbf(D, D_min=0., D_max=1., D_count=16, device='cpu'):
 
     RBF = torch.exp(-((D_expand - D_mu) / D_sigma) ** 2)
     return RBF
+
+# The remainder of the file remains unchanged
 
 
 def unbatch(src, batch, dim: int = 0):

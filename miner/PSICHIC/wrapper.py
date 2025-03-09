@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 import torch
+import torch.cuda
 
 from .psichic_utils.dataset import ProteinMoleculeDataset
 from .psichic_utils.data_utils import DataLoader, virtual_screening
@@ -16,6 +17,13 @@ class PsichicWrapper:
     def __init__(self):
         self.runtime_config = RuntimeConfig()
         self.device = self.runtime_config.DEVICE
+        # Enable cuDNN benchmark for optimal performance
+        torch.backends.cudnn.benchmark = True
+        # Set deterministic to False for better performance
+        torch.backends.cudnn.deterministic = False
+        # Enable TF32 precision for faster computation on Ampere+ GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
         
         with open(os.path.join(self.runtime_config.MODEL_PATH, 'config.json'), 'r') as f:
             self.model_config = json.load(f)
@@ -23,10 +31,11 @@ class PsichicWrapper:
     def load_model(self):
         degree_dict = torch.load(os.path.join(self.runtime_config.MODEL_PATH,
                                               'degree.pt'), 
-                                 weights_only=True
+                                 weights_only=True,
+                                 map_location=self.device
                                  )
         param_dict = os.path.join(self.runtime_config.MODEL_PATH, 'model.pt')
-        mol_deg, prot_deg = degree_dict['ligand_deg'], degree_dict['protein_deg']
+        mol_deg, prot_deg = degree_dict['ligand_deg'].cuda(), degree_dict['protein_deg'].cuda()
         
         self.model = net(mol_deg, prot_deg,
                          # MOLECULE
@@ -45,7 +54,7 @@ class PsichicWrapper:
                          dropout_attn_score=self.model_config['params']['dropout_attn_score'],
                          # output
                          regression_head=self.model_config['tasks']['regression_task'],
-                         classification_head=self.model_config['tasks']['classification_task'] ,
+                         classification_head=self.model_config['tasks']['classification_task'],
                          multiclassification_head=self.model_config['tasks']['mclassification_task'],
                          device=self.device).to(self.device)
         self.model.reset_parameters()    
@@ -63,6 +72,11 @@ class PsichicWrapper:
     def initialize_smiles(self, smiles_list:list) -> dict:
         self.smiles_list = smiles_list
         smiles_dict = ligand_init(smiles_list)
+        # Move tensors to GPU
+        for key, value in smiles_dict.items():
+            for tensor_key in value:
+                if isinstance(value[tensor_key], torch.Tensor):
+                    value[tensor_key] = value[tensor_key].cuda(non_blocking=True)
         return smiles_dict
     
     def create_screen_loader(self, protein_dict, smiles_dict):
@@ -76,9 +90,12 @@ class PsichicWrapper:
                                          device=self.device
                                          )
         
+        # Pin memory for faster data loading
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
                                         shuffle=False,
+                                        pin_memory=True,
+                                        num_workers=4,  # Use multiple workers for faster data loading
                                         follow_batch=['mol_x', 'clique_x', 'prot_node_aa']
                                         )
         
@@ -91,7 +108,10 @@ class PsichicWrapper:
         self.smiles_dict = self.initialize_smiles(smiles_list)
         torch.cuda.empty_cache()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
-        self.screen_df = virtual_screening(self.screen_df, 
+        
+        # Use mixed precision for faster computation
+        with torch.cuda.amp.autocast():
+            self.screen_df = virtual_screening(self.screen_df, 
                                            self.model, 
                                            self.screen_loader,
                                            os.getcwd(),
@@ -101,4 +121,3 @@ class PsichicWrapper:
                                            save_cluster=False,
                                            )
         return self.screen_df
-        

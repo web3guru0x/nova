@@ -3,9 +3,11 @@ import math
 import os
 import sys
 import argparse
+import traceback
 from typing import cast
 from types import SimpleNamespace
 import bittensor as bt
+import torch
 from substrateinterface import SubstrateInterface
 import requests
 from dotenv import load_dotenv
@@ -13,10 +15,13 @@ from dotenv import load_dotenv
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
+# Import GPU utilities
+from gpu_utils import setup_gpu_for_h200, empty_gpu_cache, gpu_timer, get_gpu_memory_usage, optimize_memory_for_inference
 from my_utils import get_smiles, get_random_protein, get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
 from bittensor.core.chain_data.utils import decode_metadata
 
+# Initialize PSICHIC wrapper once for the module
 psichic = PsichicWrapper()
 
 def get_config():
@@ -64,22 +69,32 @@ def run_model(protein: str, molecule: str) -> float:
     a predicted binding score. Returns 0.0 if SMILES not found or if
     there's any issue with scoring.
     """
-    smiles = get_smiles(molecule)
-    if not smiles:
-        bt.logging.debug(f"Could not retrieve SMILES for '{molecule}', returning score of 0.0.")
-        return 0.0
+    # Use GPU timer for performance monitoring
+    with gpu_timer(f"Score {molecule[:10]}"):
+        # Use automatic mixed precision for faster computation
+        with torch.cuda.amp.autocast():
+            try:
+                smiles = get_smiles(molecule)
+                if not smiles:
+                    bt.logging.debug(f"Could not retrieve SMILES for '{molecule}', returning score of 0.0.")
+                    return 0.0
 
-    results_df = psichic.run_validation([smiles])  # returns a DataFrame
-    if results_df.empty:
-        bt.logging.warning("Psichic returned an empty DataFrame, returning 0.0.")
-        return 0.0
+                results_df = psichic.run_validation([smiles])  # returns a DataFrame
+                if results_df.empty:
+                    bt.logging.warning("Psichic returned an empty DataFrame, returning 0.0.")
+                    return 0.0
 
-    predicted_score = results_df.iloc[0]['predicted_binding_affinity']
-    if predicted_score is None:
-        bt.logging.warning("No 'predicted_binding_affinity' found, returning 0.0.")
-        return 0.0
+                predicted_score = results_df.iloc[0]['predicted_binding_affinity']
+                if predicted_score is None:
+                    bt.logging.warning("No 'predicted_binding_affinity' found, returning 0.0.")
+                    return 0.0
 
-    return float(predicted_score)
+                return float(predicted_score)
+            except Exception as e:
+                bt.logging.error(f"Error running model: {e}")
+                bt.logging.error(traceback.format_exc())
+                empty_gpu_cache()  # Clean up GPU memory on error
+                return 0.0
 
 
 async def get_commitments(subtensor, metagraph, block_hash: str, netuid: int) -> dict:
@@ -95,11 +110,6 @@ async def get_commitments(subtensor, metagraph, block_hash: str, netuid: int) ->
         dict: A mapping from hotkey to a SimpleNamespace containing uid, hotkey,
               block, and decoded commitment data.
     """
-    # Use the provided netuid to fetch the corresponding metagraph.
-    #metagraph = await subtensor.metagraph(netuid)
-    # Determine the block hash if a block is specified.
-    #block_hash = await subtensor.determine_block_hash(block) if block is not None else None
-
     # Gather commitment queries for all validators (hotkeys) concurrently.
     commits = await asyncio.gather(*[
         subtensor.substrate.query(
@@ -135,6 +145,16 @@ async def main(config):
     Args:
         config: Configuration object for subtensor and wallet.
     """
+    # Setup GPU for optimal performance
+    if not setup_gpu_for_h200():
+        bt.logging.error("GPU setup failed - check your CUDA installation")
+        sys.exit(1)
+        
+    bt.logging.info(f"GPU memory before initialization: {get_gpu_memory_usage()}")
+    
+    # Optimize memory allocation for inference workloads
+    optimize_memory_for_inference(max_batch_size=64)  # Smaller batch size for validator
+
     wallet = bt.wallet(config=config)
 
     # Initialize the asynchronous subtensor client.
@@ -147,120 +167,194 @@ async def main(config):
     tolerance = 3 # block tolerance window for validators to commit protein
 
     while True:
-        # Fetch the current metagraph for the given subnet (netuid 68).
-        metagraph = await subtensor.metagraph(config.netuid)
-        bt.logging.debug(f'Found {metagraph.n} nodes in network')
-        current_block = await subtensor.get_current_block()
+        try:
+            # Fetch the current metagraph for the given subnet (netuid 68).
+            metagraph = await subtensor.metagraph(config.netuid)
+            bt.logging.debug(f'Found {metagraph.n} nodes in network')
+            current_block = await subtensor.get_current_block()
 
-        # Check if the current block marks the end of an epoch (using a 360-block interval).
-        if current_block % config.epoch_length == 0:
+            # Check if the current block marks the end of an epoch (using a 360-block interval).
+            if current_block % config.epoch_length == 0:
+                # Clean GPU memory at start of epoch
+                empty_gpu_cache()
+                bt.logging.info(f"GPU memory at epoch start: {get_gpu_memory_usage()}")
 
-            try:
-                # Set the next commitment target protein.
-                protein = get_random_protein()
-                await subtensor.set_commitment(
-                    wallet=wallet,
-                    netuid=config.netuid,
-                    data=protein
-                )
-                bt.logging.info(f'Commited successfully: {protein}')
-            except Exception as e:
-                bt.logging.error(f'Error: {e}')
-
-            # Retrieve commitments from the previous epoch.
-            prev_epoch = current_block - config.epoch_length
-            best_stake = -math.inf
-            current_protein = None
-
-            block_to_check = prev_epoch
-            block_hash_to_check = await subtensor.determine_block_hash(block_to_check + tolerance)  
-            epoch_metagraph = await subtensor.metagraph(config.netuid, block=block_to_check + tolerance)
-            epoch_commitments = await get_commitments(subtensor, epoch_metagraph, block_hash_to_check, netuid=config.netuid)
-            epoch_commitments = {k: v for k, v in epoch_commitments.items() if current_block - v.block <= (config.epoch_length + tolerance)}
-            high_stake_protein_commitment = max(
-                epoch_commitments.values(),
-                key=lambda commit: epoch_metagraph.S[commit.uid],
-                default=None
-            )
-            if not high_stake_protein_commitment:
-                bt.logging.error("Error getting current protein commitment.")
-                current_protein = None
-                continue
-
-            current_protein = high_stake_protein_commitment.data
-            bt.logging.info(f"Current protein: {current_protein}")
-
-            protein_sequence = get_sequence_from_protein_code(current_protein)
-
-            # Initialize PSICHIC for new protein
-            bt.logging.info(f'Initializing model for protein sequence: {protein_sequence}')
-            try:
-                psichic.run_challenge_start(protein_sequence)
-                bt.logging.info('Model initialized successfully.')
-            except Exception as e:
                 try:
-                    os.system(f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt')} https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt")
-                    psichic.run_challenge_start(protein_sequence)
-                    bt.logging.info('Model initialized successfully.')
-                except Exception as e:
-                    bt.logging.error(f'Error initializing model: {e}')
-
-            # Retrieve the latest commitments (current epoch).
-            current_block_hash = await subtensor.determine_block_hash(current_block)
-            current_commitments = await get_commitments(subtensor, metagraph, current_block_hash, netuid=config.netuid)
-
-            # Identify the best molecule based on the scoring function.
-            best_score = -math.inf
-            total_commits = 0
-            best_molecule = None
-            for hotkey, commit in current_commitments.items():
-                if current_block - commit.block <= config.epoch_length:
-                    total_commits += 1
-                    # Assuming that 'commit.data' contains the necessary molecule data; adjust if needed.
-                    score = run_model(protein=current_protein, molecule=commit.data)
-                    # If the score is higher, or equal but the block is earlier, update the best.
-                    if (score > best_score) or (score == best_score and best_molecule is not None and commit.block < best_molecule.block):
-                        best_score = score
-                        best_molecule = commit
-
-            # Ensure a best molecule was found before setting weights.
-            if best_molecule is not None:
-                try:
-                    # Create weights where the best molecule's UID receives full weight.
-                    weights = [0.0 for i in range(metagraph.n)]
-                    print(current_block)
-                    weights[best_molecule.uid] = 1.0
-                    print(weights)
-                    uids = list(range(metagraph.n))
-                    result, message = await subtensor.set_weights(
+                    # Set the next commitment target protein.
+                    protein = get_random_protein()
+                    await subtensor.set_commitment(
                         wallet=wallet,
-                        uids=uids,
-                        weights=weights,
                         netuid=config.netuid,
-                        wait_for_inclusion=True,
-                        )
-                    if result:
-                        bt.logging.info(f"Weights set successfully: {weights}.")
-                    else:
-                        bt.logging.error(f"Error setting weights: {message}")
+                        data=protein
+                    )
+                    bt.logging.info(f'Committed successfully: {protein}')
                 except Exception as e:
-                    bt.logging.error(f"Error setting weights: {e}")
-            else:
-                bt.logging.info("No valid molecule commitment found for current epoch.")
+                    bt.logging.error(f'Error: {e}')
 
-            # Sleep briefly to prevent busy-waiting (adjust sleep time as needed).
-            await asyncio.sleep(1)
-            
-        # keep validator alive
-        elif current_block % (config.epoch_length/2) == 0:
-            subtensor = bt.async_subtensor(network=config.network)
-            await subtensor.initialize()
-            bt.logging.info("Validator reset subtensor connection.")
-            await asyncio.sleep(12) # Sleep for 1 block to avoid unncessary re-connection
-            
-        else:
-            bt.logging.info(f"Waiting for epoch to end... {config.epoch_length - (current_block % config.epoch_length)} blocks remaining.")
-            await asyncio.sleep(1)
+                # Retrieve commitments from the previous epoch.
+                prev_epoch = current_block - config.epoch_length
+                best_stake = -math.inf
+                current_protein = None
+
+                block_to_check = prev_epoch
+                block_hash_to_check = await subtensor.determine_block_hash(block_to_check + tolerance)  
+                epoch_metagraph = await subtensor.metagraph(config.netuid, block=block_to_check + tolerance)
+                epoch_commitments = await get_commitments(subtensor, epoch_metagraph, block_hash_to_check, netuid=config.netuid)
+                epoch_commitments = {k: v for k, v in epoch_commitments.items() if current_block - v.block <= (config.epoch_length + tolerance)}
+                high_stake_protein_commitment = max(
+                    epoch_commitments.values(),
+                    key=lambda commit: epoch_metagraph.S[commit.uid],
+                    default=None
+                )
+                if not high_stake_protein_commitment:
+                    bt.logging.error("Error getting current protein commitment.")
+                    current_protein = None
+                    continue
+
+                current_protein = high_stake_protein_commitment.data
+                bt.logging.info(f"Current protein: {current_protein}")
+
+                protein_sequence = get_sequence_from_protein_code(current_protein)
+
+                # Initialize PSICHIC for new protein
+                bt.logging.info(f'Initializing model for protein sequence: {protein_sequence}')
+                try:
+                    # Initialize model with GPU timing
+                    with gpu_timer("Model initialization"):
+                        psichic.run_challenge_start(protein_sequence)
+                    
+                    bt.logging.info('Model initialized successfully.')
+                    bt.logging.info(f"GPU memory after model init: {get_gpu_memory_usage()}")
+                except Exception as e:
+                    try:
+                        os.system(f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt')} https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt")
+                        
+                        # Clear GPU cache and try again
+                        empty_gpu_cache()
+                        
+                        with gpu_timer("Model initialization retry"):
+                            psichic.run_challenge_start(protein_sequence)
+                        
+                        bt.logging.info('Model initialized successfully on retry.')
+                        bt.logging.info(f"GPU memory after model init: {get_gpu_memory_usage()}")
+                    except Exception as e:
+                        bt.logging.error(f'Error initializing model: {e}')
+                        bt.logging.error(traceback.format_exc())
+                        empty_gpu_cache()
+
+                # Retrieve the latest commitments (current epoch).
+                current_block_hash = await subtensor.determine_block_hash(current_block)
+                current_commitments = await get_commitments(subtensor, metagraph, current_block_hash, netuid=config.netuid)
+
+                # Create CUDA events for timing
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                start_event.record()
+
+                # Identify the best molecule based on the scoring function.
+                best_score = -math.inf
+                total_commits = 0
+                best_molecule = None
+                
+                # Process commitments in batches to avoid GPU memory pressure
+                batch_size = 16
+                commitment_items = list(current_commitments.items())
+                
+                # Create stream for overlapping processing
+                stream = torch.cuda.Stream()
+                
+                bt.logging.info(f"Processing {len(commitment_items)} commitments in batches of {batch_size}")
+                
+                for i in range(0, len(commitment_items), batch_size):
+                    batch = commitment_items[i:i+batch_size]
+                    
+                    # Track GPU memory usage for batches
+                    if i % (batch_size * 4) == 0:
+                        bt.logging.debug(f"Processing batch {i}-{i+batch_size}, GPU memory: {get_gpu_memory_usage()}")
+                    
+                    with torch.cuda.stream(stream):
+                        for hotkey, commit in batch:
+                            if current_block - commit.block <= config.epoch_length:
+                                total_commits += 1
+                                molecule = commit.data
+                                score = run_model(protein=current_protein, molecule=molecule)
+                                
+                                # If the score is higher, or equal but the block is earlier, update the best.
+                                if (score > best_score) or (score == best_score and best_molecule is not None and commit.block < best_molecule.block):
+                                    best_score = score
+                                    best_molecule = commit
+                                    bt.logging.info(f"New best molecule found: {molecule[:20]}... with score {score}")
+                    
+                    # Synchronize after each batch
+                    torch.cuda.current_stream().wait_stream(stream)
+                    torch.cuda.synchronize()
+                    
+                    # Occasional memory cleanup
+                    if i % (batch_size * 8) == 0:
+                        empty_gpu_cache()
+
+                end_event.record()
+                torch.cuda.synchronize()
+                process_time = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+                bt.logging.info(f"Processed {total_commits} commits in {process_time:.2f} seconds ({total_commits/process_time:.2f} commits/sec)")
+
+                # Ensure a best molecule was found before setting weights.
+                if best_molecule is not None:
+                    try:
+                        # Create weights where the best molecule's UID receives full weight.
+                        weights = [0.0 for i in range(metagraph.n)]
+                        weights[best_molecule.uid] = 1.0
+                        bt.logging.info(f"Setting weight 1.0 for UID {best_molecule.uid} with molecule {best_molecule.data[:20]}...")
+                        
+                        uids = list(range(metagraph.n))
+                        result, message = await subtensor.set_weights(
+                            wallet=wallet,
+                            uids=uids,
+                            weights=weights,
+                            netuid=config.netuid,
+                            wait_for_inclusion=True,
+                            )
+                        if result:
+                            bt.logging.info(f"Weights set successfully")
+                        else:
+                            bt.logging.error(f"Error setting weights: {message}")
+                    except Exception as e:
+                        bt.logging.error(f"Error setting weights: {e}")
+                        bt.logging.error(traceback.format_exc())
+                else:
+                    bt.logging.info("No valid molecule commitment found for current epoch.")
+
+                # Cleanup GPU memory after processing
+                empty_gpu_cache()
+                bt.logging.info(f"GPU memory after epoch processing: {get_gpu_memory_usage()}")
+                
+                # Sleep briefly to prevent busy-waiting
+                await asyncio.sleep(1)
+                
+            # Keep validator alive
+            elif current_block % (config.epoch_length/2) == 0:
+                subtensor = bt.async_subtensor(network=config.network)
+                await subtensor.initialize()
+                bt.logging.info("Validator reset subtensor connection.")
+                
+                # Periodically clean GPU memory
+                empty_gpu_cache()
+                bt.logging.info(f"GPU memory at midpoint: {get_gpu_memory_usage()}")
+                
+                await asyncio.sleep(12) # Sleep for 1 block to avoid unnecessary re-connection
+                
+            else:
+                blocks_remaining = config.epoch_length - (current_block % config.epoch_length)
+                if blocks_remaining % 60 == 0 or blocks_remaining < 10:
+                    bt.logging.info(f"Waiting for epoch to end... {blocks_remaining} blocks remaining.")
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            bt.logging.error(f"Error in main loop: {e}")
+            bt.logging.error(traceback.format_exc())
+            # Clean up GPU memory on error
+            empty_gpu_cache()
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":

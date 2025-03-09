@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 import os
 from dotenv import load_dotenv
+import torch
 
 load_dotenv()
 
 class RuntimeConfig:
     PSICHIC_PATH = os.path.dirname(os.path.abspath(__file__))
-    device = os.environ.get("DEVICE_OVERRIDE")
-    DEVICE = ["cpu" if device=="cpu" else "cuda:0"][0]
+    # Force GPU usage regardless of environment variable
+    DEVICE = "cuda:0"
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
-    BATCH_SIZE = 128
-    
+    # Significantly increased batch size for H200 SXM with 141GB VRAM
+    BATCH_SIZE = 512

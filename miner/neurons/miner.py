@@ -6,6 +6,8 @@ import asyncio
 from typing import cast
 from types import SimpleNamespace
 import sys
+import torch
+import traceback
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
@@ -18,6 +20,8 @@ import pandas as pd
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
 
+# Import our GPU utilities
+from gpu_utils import setup_gpu_for_h200, empty_gpu_cache, gpu_timer, get_gpu_memory_usage, optimize_memory_for_inference
 from my_utils import get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
 
@@ -25,9 +29,19 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 128
+        self.chunk_size = 256  # Increased chunk size for GPU processing
         self.tolerance = 3
 
+        # Setup GPU optimizations for H200 SXM
+        if not setup_gpu_for_h200():
+            bt.logging.error("GPU setup failed - check your CUDA installation")
+            sys.exit(1)
+            
+        bt.logging.info(f"GPU memory before initialization: {get_gpu_memory_usage()}")
+        
+        # Optimize memory allocation for inference workloads
+        optimize_memory_for_inference(max_batch_size=self.chunk_size)
+        
         self.config = self.get_config()
         node = SubstrateInterface(url=self.config.network)
         self.epoch_length = node.query("SubtensorModule", "Tempo", [self.config.netuid]).value
@@ -43,6 +57,9 @@ class Miner:
         self.shared_lock = asyncio.Lock()
         self.inference_task = None
         self.shutdown_event = asyncio.Event()
+        
+        # Log GPU information
+        bt.logging.info(f"GPU memory after initialization: {get_gpu_memory_usage()}")
 
     def get_config(self):
         # Set up the configuration parser.
@@ -105,7 +122,6 @@ class Miner:
                 bt.logging.info(f"UID: {uid}, Stake: {stake}")
 
     async def get_commitments(self, metagraph, block_hash: str) -> dict:
-
         """
         Retrieve commitments for all miners on a given subnet (netuid) at a specific block.
 
@@ -142,12 +158,12 @@ class Miner:
                 )
         return result
 
-
     def stream_random_chunk_from_dataset(self):
         # Streams a random chunk from the dataset repo on huggingface.
         files = list_repo_files(self.hugging_face_dataset_repo, repo_type='dataset')
         files = [file for file in files if file.endswith('.csv')]
         random_file = random.choice(files)
+        bt.logging.info(f"Loading dataset chunk from: {random_file}")
         dataset_dict = load_dataset(self.hugging_face_dataset_repo,
                                     data_files={'train': random_file},
                                     streaming=True,
@@ -190,32 +206,52 @@ class Miner:
     async def run_psichic_model_loop(self):
         """
         Continuously runs the PSICHIC model on batches of molecules from the dataset.
-
-        This method streams random chunks of molecule data from a Hugging Face dataset,
-        processes them through the PSICHIC model to predict binding affinities, and updates
-        the best candidate when a higher scoring molecule is found. Runs in a separate thread
-        until the shutdown event is triggered.
-
-        The method:
-        1. Streams data in chunks from the dataset
-        2. Cleans the product names and SMILES strings
-        3. Runs PSICHIC predictions on each chunk
-        4. Updates the best candidate if a higher score is found
-        5. Continues until shutdown_event is set
-
-        Raises:
-            Exception: Logs any errors during execution and sets the shutdown event
+        Optimized for GPU processing with H200 SXM.
         """
         dataset = self.stream_random_chunk_from_dataset()
+        
+        # Create CUDA events for timing
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        # Create CUDA streams for overlapped execution
+        stream1 = torch.cuda.Stream()
+        stream2 = torch.cuda.Stream()
+        
+        # Scaler for mixed precision
+        scaler = torch.cuda.amp.GradScaler(enabled=True)
+        
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    df = pd.DataFrame.from_dict(chunk)
-                    df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
-                    df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    # Run the PSICHIC model on the chunk.
-                    bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    # Record start time
+                    start_event.record()
+                    
+                    # Preprocess data in stream1
+                    with torch.cuda.stream(stream1):
+                        df = pd.DataFrame.from_dict(chunk)
+                        df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
+                        df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
+                    
+                    # Wait for preprocessing to complete
+                    torch.cuda.current_stream().wait_stream(stream1)
+                    
+                    # Run inference with mixed precision in stream2
+                    with torch.cuda.stream(stream2):
+                        with torch.cuda.amp.autocast():
+                            bt.logging.debug(f'Running inference on batch of {len(df)} molecules')
+                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    
+                    # Wait for inference to complete
+                    torch.cuda.current_stream().wait_stream(stream2)
+                    
+                    # Record end time and calculate duration
+                    end_event.record()
+                    torch.cuda.synchronize()
+                    duration = start_event.elapsed_time(end_event) / 1000  # Convert to seconds
+                    bt.logging.info(f"Processed {len(df)} molecules in {duration:.2f} seconds ({len(df)/duration:.2f} molecules/sec)")
+                    
+                    # Process results
                     chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
                     if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                         async with self.shared_lock:
@@ -223,11 +259,20 @@ class Miner:
                             self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
                             self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
                             bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                        await asyncio.sleep(1)
-                    await asyncio.sleep(3)
+                            
+                            # Log GPU memory stats when we find a better candidate
+                            bt.logging.debug(f"GPU memory usage: {get_gpu_memory_usage()}")
+                    
+                    # Prevent GPU overloading by occasional synchronization
+                    if random.random() < 0.05:  # 5% chance to clean up
+                        empty_gpu_cache()
+                        
+                    await asyncio.sleep(1)  # Reduced sleep time for faster throughput
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
+                bt.logging.error(traceback.format_exc())
+                empty_gpu_cache()  # Clear GPU memory on error
                 self.shutdown_event.set()
 
     async def run(self):
@@ -246,17 +291,25 @@ class Miner:
 
             protein_sequence = get_sequence_from_protein_code(start_protein)
             try:
-                self.psichic_wrapper.run_challenge_start(protein_sequence)
+                # Clear CUDA cache before model initialization
+                empty_gpu_cache()
+                
+                # Initialize model with GPU timing
+                with gpu_timer("Model initialization"):
+                    self.psichic_wrapper.run_challenge_start(protein_sequence)
+                
                 bt.logging.info(f"Initialized model for {start_protein}")
+                bt.logging.info(f"GPU memory after model init: {get_gpu_memory_usage()}")
             except Exception as e:
                 bt.logging.error(f"Error initializing model: {e}")
+                bt.logging.error(traceback.format_exc())
 
             try:
                 self.inference_task = asyncio.create_task(self.run_psichic_model_loop())
                 bt.logging.debug("Inference started on startup protein.")
             except Exception as e:
                 bt.logging.error(f"Error starting inference: {e}")
-
+                bt.logging.error(traceback.format_exc())
 
         while True:
             try:
@@ -283,21 +336,39 @@ class Miner:
                             self.last_submitted_product = None
                             self.shutdown_event = asyncio.Event()
 
+                    # Clean up GPU memory before loading new model
+                    empty_gpu_cache()
+                    bt.logging.info(f"GPU memory before new model: {get_gpu_memory_usage()}")
+                    
                     # Get protein sequence from uniprot
                     protein_sequence = get_sequence_from_protein_code(self.current_challenge_protein)
 
                     # Initialize PSICHIC for new protein
                     bt.logging.info(f'Initializing model for protein sequence: {protein_sequence}')
                     try:
-                        self.psichic_wrapper.run_challenge_start(protein_sequence)
+                        # Initialize model with GPU timing
+                        with gpu_timer("Model initialization"):
+                            self.psichic_wrapper.run_challenge_start(protein_sequence)
+                        
                         bt.logging.info('Model initialized successfully.')
+                        bt.logging.info(f"GPU memory after model init: {get_gpu_memory_usage()}")
                     except Exception as e:
                         try:
+                            # Download model if needed
                             os.system(f"wget -O {os.path.join(BASE_DIR, 'PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt')} https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt")
-                            self.psichic_wrapper.run_challenge_start(protein_sequence)
-                            bt.logging.info('Model initialized successfully.')
+                            
+                            # Clear GPU cache again
+                            empty_gpu_cache()
+                            
+                            # Try initialization again
+                            with gpu_timer("Model initialization retry"):
+                                self.psichic_wrapper.run_challenge_start(protein_sequence)
+                            
+                            bt.logging.info('Model initialized successfully on retry.')
+                            bt.logging.info(f"GPU memory after model init: {get_gpu_memory_usage()}")
                         except Exception as e:
                             bt.logging.error(f'Error initializing model: {e}')
+                            bt.logging.error(traceback.format_exc())
 
                     # Start inference loop
                     try:
@@ -305,7 +376,7 @@ class Miner:
                         bt.logging.debug(f'Inference task started successfully')
                     except Exception as e:
                         bt.logging.error(f'Error initializing inference: {e}')
-
+                        bt.logging.error(traceback.format_exc())
 
                 # Check if candidate product has changed
                 async with self.shared_lock:
@@ -337,14 +408,25 @@ class Miner:
                         f'Current epoch: {self.metagraph.block.item() // self.epoch_length}'
                     )
                     bt.logging.info(log)
+                    
+                    # Periodically clean CUDA cache
+                    if self.current_block % 360 == 0:
+                        bt.logging.info("Performing periodic GPU memory cleanup")
+                        empty_gpu_cache()
+                        bt.logging.info(f"GPU memory after cleanup: {get_gpu_memory_usage()}")
+                        
                 self.current_block += 1
 
             except RuntimeError as e:
                 bt.logging.error(e)
-                traceback.print_exc()
+                bt.logging.error(traceback.format_exc())
+                # Clear CUDA cache on error
+                empty_gpu_cache()
 
             except KeyboardInterrupt:
                 bt.logging.success("Keyboard interrupt detected. Exiting miner.")
+                # Clean up GPU resources before exit
+                empty_gpu_cache()
                 exit()
 
 # Run the miner.

@@ -34,17 +34,13 @@ def one_of_k_encoding_unk(x, allowable_set):
 
 
 def atom_features(atom):
-    #encoding = one_of_k_encoding_unk(atom.GetSymbol(),['C', 'N', 'O', 'S', 'F', 'Si', 'P', 'Cl', 'Br', 'Mg', 'Na','Ca', 'Fe', 'As', 'Al', 'I', 'B', 'V', 'K', 'Tl', 'Yb','Sb', 'Sn', 'Ag', 'Pd', 'Co', 'Se', 'Ti', 'Zn', 'H','Li', 'Ge', 'Cu', 'Au', 'Ni', 'Cd', 'In', 'Mn', 'Zr','Cr', 'Pt', 'Hg', 'Pb', 'Unknown'])
     encoding = one_of_k_encoding(atom.GetDegree(), [0,1,2,3,4,5,6,7,8,9,10]) + one_of_k_encoding_unk(atom.GetTotalNumHs(), [0,1,2,3,4,5,6,7,8,9,10])
     encoding += one_of_k_encoding_unk(atom.GetImplicitValence(), [0,1,2,3,4,5,6,7,8,9,10]) 
     encoding += one_of_k_encoding_unk(atom.GetHybridization(), [
                       Chem.rdchem.HybridizationType.SP, Chem.rdchem.HybridizationType.SP2,
                       Chem.rdchem.HybridizationType.SP3, Chem.rdchem.HybridizationType.SP3D,
                       Chem.rdchem.HybridizationType.SP3D2, 'other'])
-    # encoding += one_of_k_encoding_unk(atom.GetFormalCharge(), [0,-1,1,2,-100]) 
-    # encoding += one_of_k_encoding_unk(atom.GetNumRadicalElectrons(), [0,1,2,-100]) 
     encoding += [atom.GetIsAromatic()]
-    # encoding += [atom.IsInRing()]
 
     try:
         encoding += one_of_k_encoding_unk(
@@ -271,7 +267,7 @@ class MoleculeGraphDataset():
         return adj
 
     def junction_tree(self,mol):
-        tree_edge_index, atom2clique_index, num_cliques, x_clique = tree_decomposition(mol,return_vocab=True)
+        tree_edge_index, atom2clique_index, num_cliques, x_clique = tree_decomposition(mol, return_vocab=True)
         ## if weird compounds => each assign the separate cluster
         if atom2clique_index.nelement() == 0:
             num_cliques = len(mol.GetAtoms())
@@ -448,31 +444,44 @@ def tree_decomposition(
 def smiles2graph(m_str):
     mgd = MoleculeGraphDataset(halogen_detail=False)
     mol = Chem.MolFromSmiles(m_str)
-    #mol = get_mol(m_str)
     atom_feature, bond_feature = mgd.featurize(mol,'atom_full_feature')
     atom_idx, _ = mgd.featurize(mol,'atom_type')
     tree = mgd.junction_tree(mol)
 
     out_dict = {
-        'smiles':m_str,
-        'atom_feature':torch.tensor(atom_feature),#.to(torch.int8),
-        'atom_types':'|'.join([i.GetSymbol() for i in mol.GetAtoms()]),
-        'atom_idx':torch.tensor(atom_idx),#.to(torch.int8),
-        'bond_feature':torch.tensor(bond_feature),#.to(torch.int8),
-
+        'smiles': m_str,
+        'atom_feature': torch.tensor(atom_feature, device='cuda:0'),
+        'atom_types': '|'.join([i.GetSymbol() for i in mol.GetAtoms()]),
+        'atom_idx': torch.tensor(atom_idx, device='cuda:0'),
+        'bond_feature': torch.tensor(bond_feature, device='cuda:0'),
     }
-    tree['tree_edge_index'] = tree['tree_edge_index']#.to(torch.int8)
-    tree['atom2clique_index'] = tree['atom2clique_index']#.to(torch.int8)
-    tree['x_clique'] = tree['x_clique']#.to(torch.int8)
+    
+    # Move tree components to GPU
+    tree['tree_edge_index'] = tree['tree_edge_index'].cuda(non_blocking=True)
+    tree['atom2clique_index'] = tree['atom2clique_index'].cuda(non_blocking=True)
+    tree['x_clique'] = tree['x_clique'].cuda(non_blocking=True)
 
     out_dict.update(tree)
     
-    return out_dict 
+    return out_dict
 ####
 
 def ligand_init(smiles_list):
-    ligand_dict = {}
-    for smiles in tqdm(smiles_list):
-        ligand_dict[smiles] = smiles2graph(smiles)
+    # Use persistent CUDA streams for parallel processing
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        ligand_dict = {}
+        # Process in batches for better GPU utilization
+        batch_size = 64
+        for i in range(0, len(smiles_list), batch_size):
+            batch = smiles_list[i:i+batch_size]
+            batch_results = {}
+            
+            for smiles in tqdm(batch):
+                batch_results[smiles] = smiles2graph(smiles)
+            
+            # Synchronize after each batch
+            torch.cuda.synchronize()
+            ligand_dict.update(batch_results)
 
     return ligand_dict

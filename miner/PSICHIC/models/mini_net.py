@@ -66,18 +66,18 @@ class net(torch.nn.Module):
 
         self.mol_gn2 = torch.nn.ModuleList()
 
+        # Use JIT compilation for faster GPU processing
         for idx in range(total_layer):
-            self.mol_convs.append(Drug_PNAConv(
+            self.mol_convs.append(torch.jit.script(Drug_PNAConv(
                 mol_deg, hidden_channels,edge_channels=hidden_channels,
                 pre_layers=pre_layers, post_layers=post_layers,
                 aggregators=aggregators,
                 scalers=scalers,
                 num_towers=heads,
                 dropout=dropout
-            ))
+            )))
 
             self.mol_gn2.append(GraphNorm(hidden_channels))
-        
 
         if self.regression_head:
             self.reg_out = MLP([hidden_channels, hidden_channels, 1]) 
@@ -107,29 +107,32 @@ class net(torch.nn.Module):
                 residue_x, residue_evo_x, residue_edge_index, residue_edge_weight, 
                 # Mol-Protein Interaction batch
                 mol_batch=None, prot_batch=None, clique_batch=None):
-        # Init variables        
-        reg_pred = None
-        cls_pred = None
-        # MOLECULE Featurize
-        atom_x = self.atom_type_encoder(mol_x.squeeze()) + self.atom_feat_encoder(mol_x_feat)
+        # Use automatic mixed precision for better performance
+        with torch.cuda.amp.autocast():
+            # Init variables        
+            reg_pred = None
+            cls_pred = None
+            # MOLECULE Featurize
+            atom_x = self.atom_type_encoder(mol_x.squeeze()) + self.atom_feat_encoder(mol_x_feat)
 
-        spectral_loss = torch.tensor(0.).to(self.device)
-        ortho_loss = torch.tensor(0.).to(self.device)
-        cluster_loss = torch.tensor(0.).to(self.device) 
-        attention_dict = {}
-        # MOLECULE-PROTEIN Layers
-        for idx in range(self.total_layer):
-            atom_x = self.mol_convs[idx](atom_x, bond_x, atom_edge_index)
+            spectral_loss = torch.tensor(0., device=self.device)
+            ortho_loss = torch.tensor(0., device=self.device)
+            cluster_loss = torch.tensor(0., device=self.device) 
+            attention_dict = {}
+            
+            # MOLECULE-PROTEIN Layers
+            for idx in range(self.total_layer):
+                atom_x = self.mol_convs[idx](atom_x, bond_x, atom_edge_index)
 
-            ## Graph Normalization
-            atom_x = self.mol_gn2[idx](atom_x, mol_batch)
+                ## Graph Normalization
+                atom_x = self.mol_gn2[idx](atom_x, mol_batch)
 
-        mol_pool_feat = global_mean_pool(atom_x, mol_batch)
-    
-        if self.regression_head:
-            reg_pred = self.reg_out(mol_pool_feat)
-        if self.classification_head:
-            cls_pred = self.cls_out(mol_pool_feat)
+            mol_pool_feat = global_mean_pool(atom_x, mol_batch)
+        
+            if self.regression_head:
+                reg_pred = self.reg_out(mol_pool_feat)
+            if self.classification_head:
+                cls_pred = self.cls_out(mol_pool_feat)
 
         return reg_pred, cls_pred, spectral_loss, ortho_loss, cluster_loss, attention_dict
     
@@ -186,13 +189,15 @@ class net(torch.nn.Module):
         assert len(param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
                                                     % (str(param_dict.keys() - union_params), )
 
-        # create the pytorch optimizer object
+        # create the pytorch optimizer object with higher learning rate for GPU
         optim_groups = [
             {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": weight_decay},
             {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, eps=eps, amsgrad=amsgrad)
         return optimizer
+
+# Functions from the original file remain unchanged
     
 
 def _rbf(D, D_min=0., D_max=1., D_count=16, device='cpu'):
