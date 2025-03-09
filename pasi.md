@@ -1,9 +1,9 @@
 export PATH=$HOME/.local/bin:$PATH
 source ~/.profile
 
-source .venv/bin/activate
-
 bash install_deps_cu124.sh
+
+source .venv/bin/activate
 
 wget -O PSICHIC/trained_weights/PDBv2020_PSICHIC/model.pt https://huggingface.co/Metanova/PSICHIC/resolve/main/model.pt
 
