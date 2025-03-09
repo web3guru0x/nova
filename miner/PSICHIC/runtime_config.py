@@ -11,4 +11,4 @@ class RuntimeConfig:
     # Forțează CUDA dacă este disponibil, ignoră DEVICE_OVERRIDE
     DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
-    BATCH_SIZE = 8192
+    BATCH_SIZE = 32000
