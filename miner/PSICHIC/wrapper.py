@@ -96,13 +96,13 @@ class PsichicWrapper:
         return smiles_dict
     
     def create_screen_loader(self, protein_dict, smiles_dict):
-    bt.logging.success(f"Creating screen_df")
-    self.screen_df = pd.DataFrame({
-        'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-        'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-    })
-    
-    bt.logging.success(f"Creating dataset")
+        bt.logging.success(f"Creating screen_df")
+        self.screen_df = pd.DataFrame({
+            'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
+            'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+        })
+        
+        bt.logging.success(f"Creating dataset")
         self.cached_dataset = ProteinMoleculeDataset(self.screen_df, 
                                     smiles_dict, 
                                     protein_dict, 
