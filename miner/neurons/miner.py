@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import sys
 import time
 import torch
+import warnings
+from rdkit import RDLogger
+RDLogger.DisableLog('rdApp.*')
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
@@ -228,11 +231,19 @@ class Miner:
             bt.logging.warning(f"Error in fingerprint calculation: {e}")
             return None
 
-    def process_batch_efficiently(self, df, mini_batch_size=256):
+    def process_batch_efficiently(self, df, mini_batch_size=128):  # Reducem pentru a evita timeout
         """Process molecules in efficient mini-batches with caching"""
+        # Verificăm dacă DataFrame-ul este gol sau nu conține coloanele necesare
+        if df.empty or 'product_name' not in df.columns or 'product_smiles' not in df.columns:
+            bt.logging.warning("DataFrame gol sau coloane lipsă!")
+            return pd.DataFrame(columns=['Ligand', self.psichic_result_column_name])
+        
         # Preprocess DataFrame
         df['product_name'] = df['product_name'].str.replace('"', '')
         df['product_smiles'] = df['product_smiles'].str.replace('"', '')
+        
+        # Debug: afisam primele câteva molecule pentru verificare
+        bt.logging.info(f"Exemplu de molecule în batch: {df['product_smiles'].iloc[:3].tolist()}")
         
         # Filter out molecules already in cache or with known similar structures
         to_process = []
@@ -240,12 +251,17 @@ class Miner:
         indices = []
         
         for idx, row in df.iterrows():
+            if pd.isna(row['product_smiles']):
+                continue  # Sari peste molecule cu SMILES invalid
+                
             cached_score = self.get_cached_or_compute_score(row['product_smiles'])
             if cached_score is not None:
                 cached_scores.append((idx, cached_score))
             else:
                 to_process.append(row['product_smiles'])
                 indices.append(idx)
+        
+        bt.logging.info(f"Molecule de procesat: {len(to_process)}, Cache hits: {len(cached_scores)}")
         
         # Process molecules that need calculation in mini-batches
         all_results = []
@@ -255,33 +271,50 @@ class Miner:
             
             if not batch_smiles:
                 continue
+            
+            try:    
+                batch_results = self.psichic_wrapper.run_validation(batch_smiles)
                 
-            batch_results = self.psichic_wrapper.run_validation(batch_smiles)
-            
-            # Update cache with new results
-            for j, smiles in enumerate(batch_smiles):
-                if j < len(batch_results):
-                    score = batch_results.iloc[j][self.psichic_result_column_name]
-                    fp = self.compute_fingerprint(smiles)
-                    if fp is not None:
-                        self.molecule_cache[smiles] = (fp, score)
-            
-            all_results.append(batch_results)
+                # Verificăm rezultatele
+                if batch_results.empty:
+                    bt.logging.warning(f"PSICHIC a returnat un DataFrame gol pentru batch-ul {i}")
+                    continue
+                    
+                # Update cache with new results
+                for j, smiles in enumerate(batch_smiles):
+                    if j < len(batch_results):
+                        if self.psichic_result_column_name in batch_results.columns:
+                            score = batch_results.iloc[j][self.psichic_result_column_name]
+                            fp = self.compute_fingerprint(smiles)
+                            if fp is not None:
+                                self.molecule_cache[smiles] = (fp, score)
+                
+                all_results.append(batch_results)
+                bt.logging.info(f"Procesate cu succes {len(batch_smiles)} molecule în batch-ul {i}")
+            except Exception as e:
+                bt.logging.error(f"Eroare la procesarea batch-ului {i}: {e}")
+                import traceback
+                bt.logging.error(traceback.format_exc())
         
         # Combine results
         if all_results:
             results_df = pd.concat(all_results, ignore_index=True)
+            bt.logging.info(f"Total rezultate: {len(results_df)}")
         else:
             # Create empty DataFrame with required columns if no new results
             results_df = pd.DataFrame(columns=['Ligand', self.psichic_result_column_name])
+            bt.logging.warning("Nu s-au găsit rezultate noi!")
         
         # Add cached results
         for idx, score in cached_scores:
-            cached_row = pd.DataFrame({
-                'Ligand': [df.iloc[idx]['product_smiles']], 
-                self.psichic_result_column_name: [score]
-            })
-            results_df = pd.concat([results_df, cached_row], ignore_index=True)
+            try:
+                cached_row = pd.DataFrame({
+                    'Ligand': [df.iloc[idx]['product_smiles']], 
+                    self.psichic_result_column_name: [score]
+                })
+                results_df = pd.concat([results_df, cached_row], ignore_index=True)
+            except Exception as e:
+                bt.logging.error(f"Eroare la adăugarea rezultatului din cache pentru idx {idx}: {e}")
         
         # Maintain cache size
         if len(self.molecule_cache) > 10000:  # Limit cache size
@@ -290,7 +323,8 @@ class Miner:
             keys_to_remove = list(self.molecule_cache.keys())[:remove_count]
             for key in keys_to_remove:
                 del self.molecule_cache[key]
-                
+        
+        bt.logging.info(f"Rezultate totale după adăugarea cache: {len(results_df)}")
         return results_df
 
     async def run_psichic_model_loop(self):
