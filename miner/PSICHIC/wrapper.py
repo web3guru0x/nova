@@ -79,7 +79,7 @@ class PsichicWrapper:
                                          device=self.device
                                          )
         
-        num_workers = 128  # Define it as a variable first
+        num_workers = 8  # Define it as a variable first
         bt.logging.success(f"Creating DataLoader with {num_workers} workers")
         self.screen_loader = DataLoader(dataset,
                                         batch_size=self.runtime_config.BATCH_SIZE,
