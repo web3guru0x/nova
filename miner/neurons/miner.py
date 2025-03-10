@@ -46,6 +46,7 @@ class Miner:
         self.current_challenge_protein = None
         self.last_challenge_protein = None
         self.psichic_wrapper = PsichicWrapper()
+        self.runtime_config = self.psichic_wrapper.runtime_config
         self.candidate_product = None
         self.candidate_product_score = 0
         self.best_score = 0
@@ -58,7 +59,6 @@ class Miner:
         self.molecule_cache = {}
         self.fingerprint_similarity_threshold = self.runtime_config.SIMILARITY_THRESHOLD
         self.parallel_processing = self.runtime_config.PARALLEL_BATCH_PROCESSING
-        self.runtime_config = self.psichic_wrapper.runtime_config
 
     def get_config(self):
         # Set up the configuration parser.
