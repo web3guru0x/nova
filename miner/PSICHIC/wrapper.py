@@ -86,7 +86,7 @@ class PsichicWrapper:
                                         shuffle=False,
                                         follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
                                         num_workers=num_workers,         # Mai mulți workers
-                                        prefetch_factor=64,      # Pre-încărcare extinsă
+                                        prefetch_factor=128,      # Pre-încărcare extinsă
                                         pin_memory=True,
                                         persistent_workers=True
                                         )
