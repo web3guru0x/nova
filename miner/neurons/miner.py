@@ -6,6 +6,7 @@ import asyncio
 from typing import cast
 from types import SimpleNamespace
 import sys
+import time
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
@@ -195,40 +196,86 @@ class Miner:
         processes them through the PSICHIC model to predict binding affinities, and updates
         the best candidate when a higher scoring molecule is found. Runs in a separate thread
         until the shutdown event is triggered.
-
-        The method:
-        1. Streams data in chunks from the dataset
-        2. Cleans the product names and SMILES strings
-        3. Runs PSICHIC predictions on each chunk
-        4. Updates the best candidate if a higher score is found
-        5. Continues until shutdown_event is set
-
-        Raises:
-            Exception: Logs any errors during execution and sets the shutdown event
         """
+        bt.logging.info("Starting PSICHIC model loop")
+        start_time_total = time.time()
+        
+        dataset_start = time.time()
         dataset = self.stream_random_chunk_from_dataset()
+        dataset_time = time.time() - dataset_start
+        bt.logging.info(f"⏱️ Dataset initialization took {dataset_time:.2f}s")
+        
+        chunk_count = 0
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
+                    chunk_count += 1
+                    bt.logging.info(f"Processing chunk #{chunk_count}")
+                    chunk_start = time.time()
+                    
+                    # Step 1: DataFrame creation and cleaning
+                    df_start = time.time()
                     df = pd.DataFrame.from_dict(chunk)
-                    df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
-                    df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    # Run the PSICHIC model on the chunk.
-                    bt.logging.debug(f'Running inference...')
+                    df['product_name'] = df['product_name'].str.replace('"', '')
+                    df['product_smiles'] = df['product_smiles'].str.replace('"', '')
+                    df_time = time.time() - df_start
+                    bt.logging.info(f"⏱️ DataFrame creation: {df_time:.2f}s for {len(df)} molecules")
+                    
+                    # Step 2: Count unique SMILES to be processed
+                    unique_start = time.time()
+                    unique_smiles = df['product_smiles'].unique()
+                    unique_time = time.time() - unique_start
+                    bt.logging.info(f"⏱️ Found {len(unique_smiles)} unique molecules in {unique_time:.2f}s")
+                    
+                    # Step 3: PSICHIC model inference
+                    bt.logging.info(f"Running PSICHIC inference on {len(unique_smiles)} unique molecules...")
+                    inference_start = time.time()
                     chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                        async with self.shared_lock:
-                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                    #     await asyncio.sleep(0.5)
-                    # await asyncio.sleep(1.5)
+                    inference_time = time.time() - inference_start
+                    bt.logging.info(f"⏱️ PSICHIC inference: {inference_time:.2f}s ({inference_time/len(unique_smiles):.4f}s per molecule)")
+                    
+                    # Step 4: Process results
+                    processing_start = time.time()
+                    if not chunk_psichic_scores.empty:
+                        chunk_psichic_scores = chunk_psichic_scores.sort_values(
+                            by=self.psichic_result_column_name, 
+                            ascending=False
+                        ).reset_index(drop=True)
+                        
+                        if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                            best_start = time.time()
+                            async with self.shared_lock:
+                                candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                                self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                                self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                                bt.logging.info(f"🏆 New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                            best_time = time.time() - best_start
+                            bt.logging.info(f"⏱️ Best score update: {best_time:.2f}s")
+                    
+                    processing_time = time.time() - processing_start
+                    bt.logging.info(f"⏱️ Results processing: {processing_time:.2f}s")
+                    
+                    # Step 5: Total time for this chunk
+                    chunk_time = time.time() - chunk_start
+                    bt.logging.info(f"⏱️ TOTAL CHUNK PROCESSING TIME: {chunk_time:.2f}s")
+                    
+                    # Memory stats if available
+                    try:
+                        if torch.cuda.is_available():
+                            allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+                            reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                            bt.logging.info(f"🧠 GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+                    except:
+                        pass
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
+                import traceback
+                bt.logging.error(traceback.format_exc())
                 self.shutdown_event.set()
+
+        total_time = time.time() - start_time_total
+        bt.logging.info(f"⏱️ PSICHIC model loop completed in {total_time:.2f}s, processed {chunk_count} chunks")
 
     async def run(self):
         # The Main Mining Loop.
