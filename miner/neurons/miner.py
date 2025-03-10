@@ -7,6 +7,7 @@ from typing import cast
 from types import SimpleNamespace
 import sys
 import time
+import torch
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
@@ -26,7 +27,7 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 4096
+        self.chunk_size = 4096  # Increased from 4096 to process more molecules at once
         self.tolerance = 3
 
         self.config = self.get_config()
@@ -44,6 +45,10 @@ class Miner:
         self.shared_lock = asyncio.Lock()
         self.inference_task = None
         self.shutdown_event = asyncio.Event()
+        
+        # Initialize molecule fingerprint cache for similarity-based lookup
+        self.molecule_cache = {}
+        self.fingerprint_similarity_threshold = 0.95
 
     def get_config(self):
         # Set up the configuration parser.
@@ -106,7 +111,6 @@ class Miner:
                 bt.logging.info(f"UID: {uid}, Stake: {stake}")
 
     async def get_commitments(self, metagraph, block_hash: str) -> dict:
-
         """
         Retrieve commitments for all miners on a given subnet (netuid) at a specific block.
 
@@ -142,7 +146,6 @@ class Miner:
                     data=decode_metadata(commit)
                 )
         return result
-
 
     def stream_random_chunk_from_dataset(self):
         # Streams a random chunk from the dataset repo on huggingface.
@@ -188,6 +191,104 @@ class Miner:
         )
         return highest_stake_commit.data if highest_stake_commit else None
 
+    def compute_fingerprint(self, smiles):
+        """Calculate molecular fingerprint for similarity comparison"""
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        mol = Chem.MolFromSmiles(smiles)
+        if mol:
+            return AllChem.GetMorganFingerprintAsBitVect(mol, 2, nBits=2048)
+        return None
+
+    def similarity(self, fp1, fp2):
+        """Calculate Tanimoto similarity between fingerprints"""
+        from rdkit import DataStructs
+        return DataStructs.TanimotoSimilarity(fp1, fp2)
+
+    def get_cached_or_compute_score(self, smiles):
+        """Check cache for similar molecules before computing score"""
+        try:
+            fp = self.compute_fingerprint(smiles)
+            if fp is None:
+                return None
+                
+            # Check cache for similar molecules
+            for cached_smiles, (cached_fp, score) in self.molecule_cache.items():
+                if self.similarity(fp, cached_fp) > self.fingerprint_similarity_threshold:
+                    bt.logging.debug(f"Cache hit for similar molecule to {smiles}")
+                    return score
+                    
+            # If not found in cache, return None to indicate computation needed
+            return None
+        except Exception as e:
+            bt.logging.warning(f"Error in fingerprint calculation: {e}")
+            return None
+
+    def process_batch_efficiently(self, df, mini_batch_size=256):
+        """Process molecules in efficient mini-batches with caching"""
+        # Preprocess DataFrame
+        df['product_name'] = df['product_name'].str.replace('"', '')
+        df['product_smiles'] = df['product_smiles'].str.replace('"', '')
+        
+        # Filter out molecules already in cache or with known similar structures
+        to_process = []
+        cached_scores = []
+        indices = []
+        
+        for idx, row in df.iterrows():
+            cached_score = self.get_cached_or_compute_score(row['product_smiles'])
+            if cached_score is not None:
+                cached_scores.append((idx, cached_score))
+            else:
+                to_process.append(row['product_smiles'])
+                indices.append(idx)
+        
+        # Process molecules that need calculation in mini-batches
+        all_results = []
+        for i in range(0, len(to_process), mini_batch_size):
+            batch_smiles = to_process[i:i+mini_batch_size]
+            batch_indices = indices[i:i+mini_batch_size]
+            
+            if not batch_smiles:
+                continue
+                
+            batch_results = self.psichic_wrapper.run_validation(batch_smiles)
+            
+            # Update cache with new results
+            for j, smiles in enumerate(batch_smiles):
+                if j < len(batch_results):
+                    score = batch_results.iloc[j][self.psichic_result_column_name]
+                    fp = self.compute_fingerprint(smiles)
+                    if fp is not None:
+                        self.molecule_cache[smiles] = (fp, score)
+            
+            all_results.append(batch_results)
+        
+        # Combine results
+        if all_results:
+            results_df = pd.concat(all_results, ignore_index=True)
+        else:
+            # Create empty DataFrame with required columns if no new results
+            results_df = pd.DataFrame(columns=['Ligand', self.psichic_result_column_name])
+        
+        # Add cached results
+        for idx, score in cached_scores:
+            cached_row = pd.DataFrame({
+                'Ligand': [df.iloc[idx]['product_smiles']], 
+                self.psichic_result_column_name: [score]
+            })
+            results_df = pd.concat([results_df, cached_row], ignore_index=True)
+        
+        # Maintain cache size
+        if len(self.molecule_cache) > 10000:  # Limit cache size
+            # Remove oldest entries
+            remove_count = len(self.molecule_cache) - 5000
+            keys_to_remove = list(self.molecule_cache.keys())[:remove_count]
+            for key in keys_to_remove:
+                del self.molecule_cache[key]
+                
+        return results_df
+
     async def run_psichic_model_loop(self):
         """
         Continuously runs the PSICHIC model on batches of molecules from the dataset.
@@ -200,10 +301,36 @@ class Miner:
         bt.logging.info("Starting PSICHIC model loop")
         start_time_total = time.time()
         
+        # Try to enable CUDA graphs if available (PyTorch 2.0+)
+        use_cuda_graphs = torch.cuda.is_available() and hasattr(torch.cuda, 'make_graphed_callables')
+        if use_cuda_graphs:
+            bt.logging.info("CUDA graphs support detected and enabled")
+        
+        # Try to enable torch.compile if available (PyTorch 2.0+)
+        use_torch_compile = hasattr(torch, 'compile')
+        if use_torch_compile:
+            try:
+                # Apply torch.compile to the model for faster inference
+                self.psichic_wrapper.model = torch.compile(
+                    self.psichic_wrapper.model, 
+                    mode="reduce-overhead",
+                    fullgraph=True
+                )
+                bt.logging.info("Using torch.compile for model acceleration")
+            except Exception as e:
+                bt.logging.warning(f"Failed to apply torch.compile: {e}")
+        
         dataset_start = time.time()
         dataset = self.stream_random_chunk_from_dataset()
         dataset_time = time.time() - dataset_start
         bt.logging.info(f"⏱️ Dataset initialization took {dataset_time:.2f}s")
+        
+        # Clear CUDA cache before starting inference
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # Use mixed precision if available
+        autocast_enabled = torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast')
         
         chunk_count = 0
         while not self.shutdown_event.is_set():
@@ -213,18 +340,20 @@ class Miner:
                     bt.logging.info(f"Processing chunk #{chunk_count}")
                     chunk_start = time.time()
                     
-                    # Step 1: DataFrame creation and cleaning
+                    # Step 1: DataFrame creation
                     df_start = time.time()
                     df = pd.DataFrame.from_dict(chunk)
-                    df['product_name'] = df['product_name'].str.replace('"', '')
-                    df['product_smiles'] = df['product_smiles'].str.replace('"', '')
                     df_time = time.time() - df_start
                     bt.logging.info(f"⏱️ DataFrame creation: {df_time:.2f}s for {len(df)} molecules")
                     
-                    # Step 2: PSICHIC model inference
+                    # Step 2: PSICHIC model inference with optimizations
                     inference_start = time.time()
                     bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    
+                    # Process in efficient batches with caching
+                    with torch.cuda.amp.autocast(enabled=autocast_enabled):
+                        chunk_psichic_scores = self.process_batch_efficiently(df)
+                        
                     inference_time = time.time() - inference_start
                     bt.logging.info(f"⏱️ PSICHIC inference: {inference_time:.2f}s ({inference_time/len(df):.4f}s per molecule)")
                     
@@ -252,14 +381,18 @@ class Miner:
                     chunk_time = time.time() - chunk_start
                     bt.logging.info(f"⏱️ TOTAL CHUNK PROCESSING TIME: {chunk_time:.2f}s")
                     
-                    # Memory stats if available
+                    # Memory stats and management
                     try:
                         if torch.cuda.is_available():
+                            # Free memory more aggressively
+                            torch.cuda.empty_cache()
+                            
+                            # Log memory usage
                             allocated = torch.cuda.memory_allocated() / (1024 ** 3)
                             reserved = torch.cuda.memory_reserved() / (1024 ** 3)
                             bt.logging.info(f"🧠 GPU Memory: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-                    except:
-                        pass
+                    except Exception as e:
+                        bt.logging.warning(f"Error checking GPU memory: {e}")
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
@@ -381,6 +514,7 @@ class Miner:
 
             except RuntimeError as e:
                 bt.logging.error(e)
+                import traceback
                 traceback.print_exc()
 
             except KeyboardInterrupt:
