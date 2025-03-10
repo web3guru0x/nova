@@ -28,7 +28,7 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 2048  # Mărit pentru H200
+        self.chunk_size = 4096  # Mărit pentru H200
         self.tolerance = 3
 
         # Optimizări H200
