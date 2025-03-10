@@ -23,6 +23,10 @@ sys.path.append(BASE_DIR)
 from my_utils import get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
 
+# Activează fallback pentru torch._dynamo errors la nivel global
+if hasattr(torch, '_dynamo'):
+    torch._dynamo.config.suppress_errors = True
+
 class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
@@ -306,19 +310,9 @@ class Miner:
         if use_cuda_graphs:
             bt.logging.info("CUDA graphs support detected and enabled")
         
-        # Try to enable torch.compile if available (PyTorch 2.0+)
-        use_torch_compile = hasattr(torch, 'compile')
-        if use_torch_compile:
-            try:
-                # Apply torch.compile to the model for faster inference
-                self.psichic_wrapper.model = torch.compile(
-                    self.psichic_wrapper.model, 
-                    mode="reduce-overhead",
-                    fullgraph=True
-                )
-                bt.logging.info("Using torch.compile for model acceleration")
-            except Exception as e:
-                bt.logging.warning(f"Failed to apply torch.compile: {e}")
+        # Dezactivăm torch.compile pentru a evita problemele de compatibilitate
+        use_torch_compile = False
+        bt.logging.info("torch.compile dezactivat pentru compatibilitate")
         
         dataset_start = time.time()
         dataset = self.stream_random_chunk_from_dataset()
@@ -351,7 +345,10 @@ class Miner:
                     bt.logging.debug(f'Running inference...')
                     
                     # Process in efficient batches with caching
-                    with torch.cuda.amp.autocast(enabled=autocast_enabled):
+                    if autocast_enabled:
+                        with torch.amp.autocast(device_type='cuda', enabled=True):
+                            chunk_psichic_scores = self.process_batch_efficiently(df)
+                    else:
                         chunk_psichic_scores = self.process_batch_efficiently(df)
                         
                     inference_time = time.time() - inference_start

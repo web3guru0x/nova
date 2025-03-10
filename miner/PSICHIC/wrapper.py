@@ -29,6 +29,11 @@ class PsichicWrapper:
             torch.set_num_threads(8)  
             
     def load_model(self):
+        # Activează fallback pentru torch._dynamo errors
+        if hasattr(torch, '_dynamo'):
+            torch._dynamo.config.suppress_errors = True
+            bt.logging.info("torch._dynamo.config.suppress_errors setat la True pentru a permite fallback la eager mode")
+            
         degree_dict = torch.load(os.path.join(self.runtime_config.MODEL_PATH,
                                               'degree.pt'), 
                                  weights_only=True
@@ -73,13 +78,9 @@ class PsichicWrapper:
         # Convert to half precision to speed up computation and reduce memory usage
         self.model = self.model.half()
         
-        # Use torch.compile for PyTorch 2.0+ (if available)
+        # Dezactivăm torch.compile pentru a evita problemele de compatibilitate
         if hasattr(torch, 'compile'):
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                bt.logging.info("Using torch.compile for model acceleration")
-            except Exception as e:
-                bt.logging.warning(f"Could not compile model: {e}")
+            bt.logging.info("torch.compile disponibil, dar dezactivat pentru compatibilitate")
                 
         # Set model to evaluation mode
         self.model.eval()
@@ -185,9 +186,9 @@ class PsichicWrapper:
                 # Move batch to device
                 batch = batch.to(self.device)
                 
-                # Run inference with autocast for mixed precision
+                # Run inference with autocast for mixed precision - using corrected syntax
                 if amp_enabled:
-                    with torch.cuda.amp.autocast():
+                    with torch.amp.autocast(device_type='cuda', enabled=True):
                         reg_pred, cls_pred, mcls_pred, sp_loss, o_loss, cl_loss, attention_dict = self.model(
                             # Molecule
                             mol_x=batch.mol_x, mol_x_feat=batch.mol_x_feat, bond_x=batch.mol_edge_attr,
