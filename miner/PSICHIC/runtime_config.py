@@ -9,5 +9,5 @@ class RuntimeConfig:
     device = os.environ.get("DEVICE_OVERRIDE")
     DEVICE = "cuda:0"  # Forțat pe primul GPU
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
-    BATCH_SIZE = 8
+    BATCH_SIZE = 2048
     
