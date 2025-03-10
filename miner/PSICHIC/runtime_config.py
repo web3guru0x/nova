@@ -17,26 +17,28 @@ class RuntimeConfig:
     
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
     
-    # Mărește batch_size pentru H200 cu 141GB VRAM
-    BATCH_SIZE = 8192  # Valoarea inițială de 2048 crescută la 8192
+    # Optimizări extreme pentru batch size pe H200
+    BATCH_SIZE = 65536  # Mărit dramatic pentru H200 cu 141GB VRAM
     
-    # Adăugăm parametri pentru optimizarea performanței
-    NUM_WORKERS = 32  # Ajustează în funcție de CPU
-    PREFETCH_FACTOR = 4
+    # Optimizări CPU și paralelizare
+    NUM_WORKERS = 8  # Redus pentru a evita overhead-ul
+    PREFETCH_FACTOR = 1
     USE_MIXED_PRECISION = True
     
     # Optimizări pentru CUDA
     if DEVICE.startswith('cuda'):
-        # Activează optimizări CUDA
         torch.backends.cudnn.benchmark = True
-        # Setează dimensiunea cache-ului CUDA (în MB)
-        CUDA_CACHE_SIZE_MB = 4096  # 4GB cache pentru lookups
-        # Setează toleranța la imprecizie pentru mixed precision
-        CUDA_AMP_TOLERANCE = 1e-4
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.enabled = True
+        torch.set_float32_matmul_precision('high') 
         
-    # Opțiuni pentru caching
-    ENABLE_MODEL_CACHING = True
-    MOLECULE_CACHE_SIZE = 10000  # Numărul maxim de molecule în cache
+    # Model size
+    MODEL_HIDDEN_DIM_OVERRIDE = 2048  # Redus semnificativ pentru viteză
     
-    # Parametri pentru rețeaua neurală
-    MODEL_HIDDEN_DIM_OVERRIDE = 4096  # Dimensiunea hidden layer redusă pentru performanță
+    # Optimizare paralelă
+    PARALLEL_BATCH_PROCESSING = True
+    MAX_PARALLEL_WORKERS = 4
+    
+    # Cache agresiv
+    MOLECULE_CACHE_SIZE = 50000  # Mărire cache
+    SIMILARITY_THRESHOLD = 0.85  # Threshold redus pentru mai multe cache hits

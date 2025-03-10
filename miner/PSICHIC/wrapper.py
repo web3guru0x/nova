@@ -96,32 +96,38 @@ class PsichicWrapper:
         return smiles_dict
     
     def create_screen_loader(self, protein_dict, smiles_dict):
-        bt.logging.success(f"Creating screen_df")
-        self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-                                       'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-                                       })
+    bt.logging.success(f"Creating screen_df")
+    self.screen_df = pd.DataFrame({
+        'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
+        'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+    })
+    
+    bt.logging.success(f"Creating dataset")
+        self.cached_dataset = ProteinMoleculeDataset(self.screen_df, 
+                                    smiles_dict, 
+                                    protein_dict, 
+                                    device=self.device
+                                    )
         
-        bt.logging.success(f"Creating dataset")
-        dataset = ProteinMoleculeDataset(self.screen_df, 
-                                         smiles_dict, 
-                                         protein_dict, 
-                                         device=self.device
-                                         )
+        # Calculează batch size optim
+        num_molecules = len(self.smiles_list)
+        if num_molecules <= 128:
+            batch_size = num_molecules
+        elif num_molecules <= 1024:
+            batch_size = 512
+        else:
+            batch_size = min(self.runtime_config.BATCH_SIZE, num_molecules)
         
-        # Optimize DataLoader parameters for your H200
-        num_workers = 32  # Adjust based on your CPU core count
-        batch_size = 8192  # Increased batch size for H200
-        
-        bt.logging.success(f"Creating DataLoader with {num_workers} workers and batch_size {batch_size}")
-        self.screen_loader = DataLoader(dataset,
-                                        batch_size=batch_size,
-                                        shuffle=False,
-                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
-                                        num_workers=num_workers,
-                                        prefetch_factor=4,
-                                        pin_memory=True,
-                                        persistent_workers=True
-                                        )
+        bt.logging.success(f"Creating DataLoader with {self.runtime_config.NUM_WORKERS} workers and batch_size {batch_size}")
+        self.screen_loader = DataLoader(self.cached_dataset,
+                                    batch_size=batch_size,
+                                    shuffle=False,
+                                    follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
+                                    num_workers=self.runtime_config.NUM_WORKERS,
+                                    prefetch_factor=self.runtime_config.PREFETCH_FACTOR,
+                                    pin_memory=True,
+                                    persistent_workers=True
+                                    )
         
     def run_challenge_start(self, protein_seq:str):
         # Clear CUDA cache
@@ -132,30 +138,31 @@ class PsichicWrapper:
         self.protein_dict = self.initialize_protein(protein_seq)
         
     def run_validation(self, smiles_list:list) -> pd.DataFrame:
-        """
-        Runs validation on the provided list of SMILES strings.
-        Implements performance optimizations like batching, mixed precision, and caching.
-        
-        Args:
-            smiles_list: List of SMILES strings to validate
-            
-        Returns:
-            DataFrame with validation results
-        """
-        # Clear CUDA cache before running validation
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        # Initialize smiles dictionary if not already done
+        """Optimized validation with caching for DataLoader and batching"""
+        # Initialize smiles dictionary
         self.smiles_dict = self.initialize_smiles(smiles_list)
         
-        # Create screen loader with optimized batch size and workers
-        self.create_screen_loader(self.protein_dict, self.smiles_dict)
+        # DataLoader caching strategy
+        if hasattr(self, 'cached_dataset') and hasattr(self, 'cached_smiles_dict') and len(smiles_list) < 5000:
+            # Compare if the new smiles list is similar to the cached one
+            if set(smiles_list).issubset(set(self.cached_smiles_dict.keys())):
+                bt.logging.info("Reutilizare dataset și DataLoader pentru batch similar")
+                # Create subset DataFrame
+                self.screen_df = pd.DataFrame({
+                    'Protein': [k for k in self.protein_seq for _ in smiles_list],
+                    'Ligand': [l for l in smiles_list for _ in self.protein_seq],
+                })
+            else:
+                # Re-create dataset and DataLoader
+                self.create_screen_loader(self.protein_dict, self.smiles_dict)
+                self.cached_smiles_dict = self.smiles_dict
+        else:
+            # Create new dataset and DataLoader
+            self.create_screen_loader(self.protein_dict, self.smiles_dict)
+            self.cached_smiles_dict = self.smiles_dict
         
-        # Enable mixed precision for faster computation
-        amp_enabled = torch.cuda.is_available() and hasattr(torch.cuda, 'amp') and hasattr(torch.cuda.amp, 'autocast')
-        
-        # Run inference with mixed precision
+        # Run inference
+        amp_enabled = torch.cuda.is_available()
         results_df = self.run_inference_with_optimizations(amp_enabled)
         
         return results_df
