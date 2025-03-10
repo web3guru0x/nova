@@ -9,7 +9,7 @@ class RuntimeConfig:
     device = os.environ.get("DEVICE_OVERRIDE")
     DEVICE = ["cpu" if device=="cpu" else "cuda:0"][0]
     MODEL_PATH = os.path.join(PSICHIC_PATH, 'trained_weights', 'PDBv2020_PSICHIC')
-    BATCH_SIZE = 2048  # Mărit substanțial pentru H200 cu 140GB memorie
+    BATCH_SIZE = 512  # Mărit substanțial pentru H200 cu 140GB memorie
     
     # Optimizări pentru H200
     TORCH_CUDA_ARCH_LIST = "9.0"
