@@ -4,6 +4,7 @@ import json
 import os
 import pandas as pd
 import torch
+import bittensor as bt
 
 from .psichic_utils.dataset import ProteinMoleculeDataset
 from .psichic_utils.data_utils import DataLoader, virtual_screening
@@ -21,10 +22,6 @@ class PsichicWrapper:
             self.model_config = json.load(f)
             
     def load_model(self):
-        # Enable cudnn benchmark for faster performance on fixed input sizes
-        if self.device != "cpu":
-            torch.backends.cudnn.benchmark = True
-            
         degree_dict = torch.load(os.path.join(self.runtime_config.MODEL_PATH,
                                               'degree.pt'), 
                                  weights_only=True
@@ -70,29 +67,29 @@ class PsichicWrapper:
         return smiles_dict
     
     def create_screen_loader(self, protein_dict, smiles_dict):
+        bt.logging.success(f"Creating screen_df")
         self.screen_df = pd.DataFrame({'Protein': [k for k in self.protein_seq for _ in self.smiles_list],
-                                    'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
-                                    })
+                                       'Ligand': [l for l in self.smiles_list for _ in self.protein_seq],
+                                       })
         
+        bt.logging.success(f"Creating dataset")
         dataset = ProteinMoleculeDataset(self.screen_df, 
-                                        smiles_dict, 
-                                        protein_dict, 
-                                        device=self.device
-                                        )
+                                         smiles_dict, 
+                                         protein_dict, 
+                                         device=self.device
+                                         )
         
-        # Optimizări dataloader
-        num_workers = self.runtime_config.NUM_WORKERS if hasattr(self.runtime_config, 'NUM_WORKERS') else 16
-        prefetch_factor = self.runtime_config.PREFETCH_FACTOR if hasattr(self.runtime_config, 'PREFETCH_FACTOR') else 4
-        pin_memory = self.device != "cpu"
-        
+        num_workers = 128  # Define it as a variable first
+        bt.logging.success(f"Creating DataLoader with {num_workers} workers")
         self.screen_loader = DataLoader(dataset,
-                                    batch_size=self.runtime_config.BATCH_SIZE,
-                                    shuffle=False,
-                                    follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
-                                    num_workers=num_workers,
-                                    pin_memory=pin_memory,
-                                    prefetch_factor=prefetch_factor,
-                                    persistent_workers=True if num_workers > 0 else False)
+                                        batch_size=self.runtime_config.BATCH_SIZE,
+                                        shuffle=False,
+                                        follow_batch=['mol_x', 'clique_x', 'prot_node_aa'],
+                                        num_workers=num_workers,         # Mai mulți workers
+                                        prefetch_factor=64,      # Pre-încărcare extinsă
+                                        pin_memory=True,
+                                        persistent_workers=True
+                                        )
         
     def run_challenge_start(self, protein_seq:str):
         torch.cuda.empty_cache()
@@ -103,19 +100,14 @@ class PsichicWrapper:
         self.smiles_dict = self.initialize_smiles(smiles_list)
         torch.cuda.empty_cache()
         self.create_screen_loader(self.protein_dict, self.smiles_dict)
-        
-        # Enable mixed precision if supported and configured
-        use_amp = self.runtime_config.USE_MIXED_PRECISION if hasattr(self.runtime_config, 'USE_MIXED_PRECISION') and self.device != "cpu" else False
-        
-        # Use the updated autocast API
-        with torch.amp.autocast('cuda' if use_amp and self.device != "cpu" else 'cpu', enabled=use_amp):
-            self.screen_df = virtual_screening(self.screen_df, 
-                                            self.model, 
-                                            self.screen_loader,
-                                            os.getcwd(),
-                                            save_interpret=False,
-                                            ligand_dict=self.smiles_dict, 
-                                            device=self.device,
-                                            save_cluster=False,
-                                            )
+        self.screen_df = virtual_screening(self.screen_df, 
+                                           self.model, 
+                                           self.screen_loader,
+                                           os.getcwd(),
+                                           save_interpret=False,
+                                           ligand_dict=self.smiles_dict, 
+                                           device=self.device,
+                                           save_cluster=False,
+                                           )
         return self.screen_df
+        

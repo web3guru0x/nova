@@ -6,7 +6,6 @@ import asyncio
 from typing import cast
 from types import SimpleNamespace
 import sys
-import time
 
 import bittensor as bt
 from bittensor.core.chain_data.utils import decode_metadata
@@ -15,8 +14,6 @@ from substrateinterface import SubstrateInterface
 from datasets import load_dataset
 from huggingface_hub import list_repo_files
 import pandas as pd
-import numpy as np
-import torch
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(BASE_DIR)
@@ -28,25 +25,8 @@ class Miner:
     def __init__(self):
         self.hugging_face_dataset_repo = 'Metanova/SAVI-2020'
         self.psichic_result_column_name = 'predicted_binding_affinity'
-        self.chunk_size = 4096  # Mărit pentru H200
+        self.chunk_size = 1024
         self.tolerance = 3
-
-        # Optimizări H200
-        if torch.cuda.is_available():
-            # Setări optimizate pentru CUDA
-            torch.backends.cudnn.benchmark = True
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            
-            # Eliberează memoria
-            torch.cuda.empty_cache()
-            
-            # Setează modul de alocare CUDA pentru fragmentare mai mare
-            os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:4096'
-            
-            # Rezervă memorie pentru cache-ul CUDA
-            reserved_memory = 51200  # ~50GB pentru cache
-            torch.cuda.set_per_process_memory_fraction(0.95)  # Folosește 95% din memorie
 
         self.config = self.get_config()
         node = SubstrateInterface(url=self.config.network)
@@ -208,69 +188,46 @@ class Miner:
         return highest_stake_commit.data if highest_stake_commit else None
 
     async def run_psichic_model_loop(self):
+        """
+        Continuously runs the PSICHIC model on batches of molecules from the dataset.
+
+        This method streams random chunks of molecule data from a Hugging Face dataset,
+        processes them through the PSICHIC model to predict binding affinities, and updates
+        the best candidate when a higher scoring molecule is found. Runs in a separate thread
+        until the shutdown event is triggered.
+
+        The method:
+        1. Streams data in chunks from the dataset
+        2. Cleans the product names and SMILES strings
+        3. Runs PSICHIC predictions on each chunk
+        4. Updates the best candidate if a higher score is found
+        5. Continues until shutdown_event is set
+
+        Raises:
+            Exception: Logs any errors during execution and sets the shutdown event
+        """
         dataset = self.stream_random_chunk_from_dataset()
-        
-        # Set up for optimal H200 performance
-        if torch.cuda.is_available():
-            torch.backends.cudnn.benchmark = True
-            
         while not self.shutdown_event.is_set():
             try:
                 for chunk in dataset:
-                    # Start timing for data preprocessing
-                    preprocess_start = time.time()
-                    
-                    # Convert the chunk to a DataFrame
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    
-                    preprocess_end = time.time()
-                    preprocess_time = preprocess_end - preprocess_start
-                    bt.logging.debug(f"Data preprocessing took {preprocess_time:.3f} seconds for {len(df)} molecules")
-                    
-                    # Process data in optimal batch size for H200
-                    try:
-                        # Start timing for model inference
-                        inference_start = time.time()
-                        
-                        # Run the PSICHIC model on the chunk
-                        bt.logging.debug(f'Running inference on batch of {len(df)} molecules...')
-                        
-                        with torch.amp.autocast('cuda' if torch.cuda.is_available() else 'cpu'):
-                            chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                        
-                        inference_end = time.time()
-                        inference_time = inference_end - inference_start
-                        molecules_per_second = len(df) / inference_time
-                        
-                        bt.logging.info(f"Inference completed in {inference_time:.3f} seconds, processing {molecules_per_second:.2f} molecules/second")
-                        
-                        chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                        
-                        if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                            async with self.shared_lock:
-                                candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                                self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                                self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                                bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                    except Exception as e:
-                        bt.logging.error(f"Error in batch processing: {e}")
-                        # Free up memory in case of error
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                    
-                    # Short sleep to prevent blocking the event loop
-                    await asyncio.sleep(1)
-                    
-                    # Periodically cleanup to prevent memory issues
-                    if torch.cuda.is_available() and random.random() < 0.1:  # 10% chance each batch
-                        torch.cuda.empty_cache()
+                    # Run the PSICHIC model on the chunk.
+                    bt.logging.debug(f'Running inference...')
+                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                        async with self.shared_lock:
+                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                    #     await asyncio.sleep(0.5)
+                    # await asyncio.sleep(1.5)
 
             except Exception as e:
                 bt.logging.error(f"Error running PSICHIC model: {e}")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 self.shutdown_event.set()
 
     async def run(self):
