@@ -221,41 +221,34 @@ class Miner:
                     df_time = time.time() - df_start
                     bt.logging.info(f"⏱️ DataFrame creation: {df_time:.2f}s for {len(df)} molecules")
                     
-                    # Step 2: Count unique SMILES to be processed
-                    unique_start = time.time()
-                    unique_smiles = df['product_smiles'].unique()
-                    unique_time = time.time() - unique_start
-                    bt.logging.info(f"⏱️ Found {len(unique_smiles)} unique molecules in {unique_time:.2f}s")
-                    
-                    # Step 3: PSICHIC model inference
-                    bt.logging.info(f"Running PSICHIC inference on {len(unique_smiles)} unique molecules...")
+                    # Step 2: PSICHIC model inference
                     inference_start = time.time()
+                    bt.logging.debug(f'Running inference...')
                     chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
                     inference_time = time.time() - inference_start
-                    bt.logging.info(f"⏱️ PSICHIC inference: {inference_time:.2f}s ({inference_time/len(unique_smiles):.4f}s per molecule)")
+                    bt.logging.info(f"⏱️ PSICHIC inference: {inference_time:.2f}s ({inference_time/len(df):.4f}s per molecule)")
                     
-                    # Step 4: Process results
+                    # Step 3: Process results
                     processing_start = time.time()
-                    if not chunk_psichic_scores.empty:
-                        chunk_psichic_scores = chunk_psichic_scores.sort_values(
-                            by=self.psichic_result_column_name, 
-                            ascending=False
-                        ).reset_index(drop=True)
-                        
-                        if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
-                            best_start = time.time()
-                            async with self.shared_lock:
-                                candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                                self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
-                                self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                                bt.logging.info(f"🏆 New best score: {self.best_score}, New candidate product: {self.candidate_product}")
-                            best_time = time.time() - best_start
-                            bt.logging.info(f"⏱️ Best score update: {best_time:.2f}s")
+                    chunk_psichic_scores = chunk_psichic_scores.sort_values(
+                        by=self.psichic_result_column_name, 
+                        ascending=False
+                    ).reset_index(drop=True)
+                    
+                    if not chunk_psichic_scores.empty and chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                        update_start = time.time()
+                        async with self.shared_lock:
+                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
+                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                            self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
+                            bt.logging.info(f"🏆 New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                        update_time = time.time() - update_start
+                        bt.logging.info(f"⏱️ Best score update: {update_time:.2f}s")
                     
                     processing_time = time.time() - processing_start
                     bt.logging.info(f"⏱️ Results processing: {processing_time:.2f}s")
                     
-                    # Step 5: Total time for this chunk
+                    # Step 4: Total time for this chunk
                     chunk_time = time.time() - chunk_start
                     bt.logging.info(f"⏱️ TOTAL CHUNK PROCESSING TIME: {chunk_time:.2f}s")
                     
